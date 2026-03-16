@@ -549,6 +549,14 @@ df <- pvp@meta.data %>%
   mutate(ymax = cumsum(freq),
          ymin = ymax - freq)
 
+# determine dominant celltype per cluster
+cluster_order <- df %>%
+  slice_max(freq, n = 1, with_ties = FALSE) %>%
+  arrange(singler_labels, desc(n)) %>%
+  pull(sketchedRES.1.5)
+
+df$sketchedRES.1.5 <- factor(df$sketchedRES.1.5, levels = cluster_order)
+
 barplot <- ggplot(df) +
   geom_rect(aes(
     xmin = as.numeric(sketchedRES.1.5) - 0.45,
@@ -572,18 +580,15 @@ ggsave(filename = paste0("Annotations/",fl,"/Leiden_SingleR_together.png"),
        width = 24,
        height = 6)
 
-
-
-
-
 ```
 
 ```{r, out.width="70%"}
 knitr::include_graphics("Annotations/DU53/Leiden_SingleR_together.png")
 ``` 
 
-From this clustering we can conclude that the epithelial cells are well defined in two separated clusters (maybe one tumoral and the other healthy epithelial cells, we will find out later). But 
+From this clustering we can conclude that the epithelial cells are well defined in two separated clusters (maybe one tumoral and the other healthy epithelial cells, we will find out later). Also a big percentage of the clusters have a main label that can be assigned to with confidence. However, there are still some clusters that do not have a main dominant label but they were rather clustered together by other thing that were NOT cell type. So these clusters are good but they still need some help to identify all the remaining cell types.
 
+IDEA:
 We could exclude the cell with confirmed labels and remake the clustering to separate the clusters again and see if the different cell types are more separated.
 
 
