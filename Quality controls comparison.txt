@@ -1,0 +1,61 @@
+Quality controls comparison
+
+
+WHAT THE CURRENT QC DOES:
+# remove cells with 0 counts
+  xenium.obj <- subset(xenium.obj, subset = nCount_Xenium > 5)
+  xenium.obj <- subset(xenium.obj, subset = nCount_Xenium < 2000) # Change based on the number of cells present in the samples, we want to get rid of the outliers
+
+Normalize Data
+FindVariablesFeatures
+ScaleData
+SketchData
+FindVariablesFeatures
+ScaleData
+PCA
+
+WHAT THE VOYAGER QC DOES:
+Counts how many of each type of controls are there  and uses them to supress the counts that ar eclearly outliers according to theses controls
+Where are cells with higher proportion of negative control spots 
+Doing it again with colData comparing ncounts with nGenes
+Histograms (this one seems to be the best one statistically speaking)
+It does a quality control on Negative controls, cells and genes
+More shit hat usefull
+Log normalize
+
+
+WHAT THE SATIJLAB QC DOES:
+Este no es específico para Xenium pero parece que lo trata de forma suficientemente general como para poder replicarse con Xenium.
+We calculate mitochondrial QC metrics with the PercentageFeatureSet() function, which calculates the percentage of counts originating from a set of features
+In the example below, we visualize QC metrics, and use these to filter cells:
+- We filter cells that have unique feature counts over 2,500 or less than 200
+- We filter cells that have >5% mitochondrial counts
+LogNormalize
+FindVariableFeatures
+ScaleData
+PCA
+Cluster
+UMAP
+FindMarkers --> finds markers that define clusters via differential expression (DE)
+Assigning cell type identity to clusters
+
+WHAT THE IMWEBER QC DOES:
+Filters using the funtion addPerCellQCMetrics
+Identifies low-quality cells by thresholding on median absolute deviation (MAD) from the median using the funtion perCellQCFilters()
+Visualizes the cells deemed to be of low quality in space
+Discards them
+log-normalize counts
+PCA
+visualize the expression of some genes in space; e.g., PIGR, IGHG3 and CEACAM6, which should mark epithelial, plasma and tumor cells, respectively
+Annotates
+
+
+
+WHAT TYPE OF OUTLIERS EXISTS IN XENIUM DATA:
+- Pocos transcripts dentro de una cel·lula
+- Errores en la segmentación cel·lular:
+	- Poco counts por área celular (lo mismo que arriba)
+	- Dos cel·lulas segmentadas como una
+	- Overlap área nuclei and cell área --> cells that are only nucleous, cells with a nuclei bigger than the cell, cells without nucleous
+- Los negative probes o system control (habría que mirar mejor que son, donde se encuentran y quitarlos)
+- Hay correlación entre counts y área ?

@@ -1,0 +1,46 @@
+ssh scapua@loginnode.carrerasresearch.org -p 4242
+
+Verification code is the one that Google give u through the app
+
+Y PARA ACCEDER AL CLUSTER QUE REALEMNETE TE PERMITE HACER COSITAS HAY QUE CONECTARSE A:
+
+ssh minastirith
+
+Mi directorio dentro del cluster:
+
+/mnt/beegfs/scapua
+
+Donde está el raw data dentro del cluster:
+
+/ijc/LABS/PORTA/RAW/xenium/DUTRENEO/20250508__150808__cystectomies_may2025
+
+Como descargar archivos del cluster en local:
+scp -r -o "ProxyJump=scapua@loginnode.carrerasresearch.org:4242" scapua@minastirith:/ijc/LABS/PORTA/RAW/xenium/DUTRENEO/20250508__150808__cystectomies_may2025/output-XETG00289__0060279__DU53__20250508__150850/cell_boundaries.csv.gz "C:\Users\sofia\Documents\Health_Data_Science\TFM\Code\DUTRENEO\RAW\XENIUM\cell_boundaries.csv.gz"
+
+To move file from one folder to the other inside the cluster
+
+Samples that we have both pre and post:
+DU45 --> 20250305_150014_DUTRENEO_RUN_6 
+DU46 --> 20250305_150014_DUTRENEO_RUN_6
+DU47 --> 20240424__162738__cistectomias_dutreneo_parte1
+DU48 -->  20240618__150104__cistectomias_xenium_2_18junio24
+DU49 -->  20240618__150104__cistectomias_xenium_2_18junio24
+DU51 -->  20240618__150104__cistectomias_xenium_2_18junio24
+DU53 --> 20250508__150808__cystectomies_may2025
+DU55 --> 20240424__162738__cistectomias_dutreneo_parte1
+DU57  --> 20240424__162738__cistectomias_dutreneo_parte1
+DU60 --> 20240424__162738__cistectomias_dutreneo_parte1
+DU61 --> 20240424__162738__cistectomias_dutreneo_parte1
+DU68 --> 20240424__162738__cistectomias_dutreneo_parte1
+DU70 -->  20240618__150104__cistectomias_xenium_2_18junio24
+DU75 --> 20240424__162738__cistectomias_dutreneo_parte1
+DU76 --> 20250508__150808__cystectomies_may2025
+
+
+To execute the code with it not stopping even if I close the window: nohup Rscrip
+t Final_QC_Xenium.R /mnt/beegfs/scapua/DUTRENEO
+ /mnt/beegfs/scapua/DUTRENEO_QC
+
+To the progress of the process whille executing :
+tail -f nohup.out
+

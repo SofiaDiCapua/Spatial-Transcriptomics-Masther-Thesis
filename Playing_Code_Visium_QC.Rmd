@@ -1,0 +1,250 @@
+---
+title: "Playing_QC_Visium"
+author: "Sofia Di Capua"
+date: "2026-02-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(Seurat)
+library(dplyr)
+library(hdf5r)
+library(arrow)
+library(ggplot2)
+library(ggpubr)
+library(ggrepel)
+library(progressr)
+library(patchwork)
+```
+
+```{r}
+setwd("C:/Users/sofia/Documents/Health_Data_Science/TFM/Code/DUTRENEO")
+file_list <- list.files("RAW/VISIUM/")
+options(future.globals.maxSize = 3e+29)
+plan("multicore", workers = 4)
+fl <- file_list[1]
+sample_name <- fl
+
+path <- paste0("RAW/VISIUM/",fl)
+```
+## Load the data
+
+```{r}
+visium.obj <- Load10X_Spatial(paste0(path,"/outs"))
+```
+
+## Normalize the data
+
+It's important to mention that the raw data and the preprocessed data are going to be saved in different places inside the `Seurat` object. There's the raw and the preprocessed data. Further functions access one or another by default. For example a pot will access the raw data but the clusterization will access the preprocessed data, that's to say, the normalized data.
+```{r}
+# # SCTransform also supported, but we use LogNormalize here
+DefaultAssay(visium.obj) <- "Spatial"
+visium.obj <- NormalizeData(visium.obj)
+
+```
+
+## Pretty plots 
+
+*nCount_Spatial* = How many RNA molecules (mRNAs) were captured and sequenced in that spot.
+
+Regions of the tissue that are depleted of cells will exhibit lower molecular counts. With the following plots we can see why is it so important to Normalize, with the violin plot having wider ranges in the areas where the ´nCount_Spatial´ is higher. 
+```{r}
+# Saving the violin plot in a variable (I don't know why, Marc's code)
+vln.plot <- VlnPlot(visium.obj, features = "nCount_Spatial", pt.size = 0) + NoLegend()
+
+# Violin plot 
+plot1 <- VlnPlot(visium.obj, features = "nCount_Spatial", pt.size = 0.1) + NoLegend()
+plot2 <- SpatialFeaturePlot(visium.obj, features = "nCount_Spatial") + theme(legend.position = "right")
+wrap_plots(plot1, plot2)
+```
+Above we can see that only a few beads contain low UNI counts.
+
+```{r}
+# Gene expression visualization
+# Select the first and second one of the following: Features(visium.obj)
+SpatialFeaturePlot(visium.obj, features = c(Features(visium.obj)[1], Features(visium.obj)[2]))
+```
+
+## Preprocessing
+Ribosomal and mitochondrial genes make up a very large fraction of total RNA (ribosomal ~80–90% of RNA; mitochondrial genes often >10–20% of detected counts in stressed spots), even though they carry little cell-type–specific information.
+Ribosomal genes reflect basic protein synthesis capacity, while mitochondrial genes reflect energy metabolism and cellular stress or damage, not specialized cellular functions.
+Removing them during QC prevents these highly abundant, housekeeping signals from dominating normalization and masking meaningful spatial and functional gene expression patterns so we can focus on **biologically relevant transcriptional signals**.
+
+```{r}
+# Regions of the tissue 
+
+# We eliminate the spots that captured almost no molecules
+# nCount_Spatial = How many RNA molecules (mRNAs) were captured and sequenced in that spot.
+visium.obj <- subset(visium.obj, subset = nCount_Spatial > 40)
+
+#selected_genes <- rownames(STobject)
+selected_genes <- rownames(visium.obj)
+#remove ribosomal genes
+selected_genes <- selected_genes[!grepl("^RP[SL][[:digit:]]|^RPLP[[:digit:]]|^RPSA", selected_genes)]
+#remove mitochondrial genes
+selected_genes <- selected_genes[!grepl("^MT-", selected_genes)]
+```
+
+
+<span style="background-color: yellow">Biological heterogeneity in single-cell RNA-seq data is often confounded by technical factors including sequencing depth. The number of molecules detected in each cell can vary significantly between cells, even within the same celltype. Interpretation of scRNA-seq data requires effective pre-processing and normalization to remove this technical variability.</span>
+
+Part of the preprocessing consists of normalizing and scaling the data, but they are going to be made at the beginning of the clustering section so that we can make the following plots before.
+## Plots
+```{r}
+# Violin plots #
+# Violin Count Plot
+# Visualize QC metrics as a violin plot
+
+vln_c <- VlnPlot(visium.obj,features = "nCount_Spatial",assay = "Spatial",group.by = "orig.ident",pt.size = 0) +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 0,hjust = 0.5)) +
+  xlab("") +
+  scale_x_discrete(breaks=c("SeuratProject"),labels=c(fl))
+vln_c
+ggsave(paste0("Visium_QC/",fl,"/Violin_Counts.png"),plot = vln_c,height = 7,width = 7)
+
+# Violin Feature Plot
+vln_f <- VlnPlot(visium.obj,features = "nFeature_Spatial",assay = "Spatial",group.by = "orig.ident",pt.size = 0) +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 0,hjust = 0.5)) +
+  xlab("") +
+  scale_x_discrete(breaks=c("SeuratProject"),labels=c(fl))
+vln_f
+ggsave(paste0("Visium_QC/",fl,"/Violin_Features.png"),plot = vln_f,height = 7,width = 7)
+
+
+h <- round(max(visium.obj@images$slice1$centroids@coords[,1])/1000)
+w <- round(max(visium.obj@images$slice1$centroids@coords[,2])/1000)
+
+
+DP <- SpatialFeaturePlot(object = visium.obj,features = "nCount_Spatial",pt.size = 2)
+DP
+ggsave(filename = paste0("Visium_QC/",fl,"/",sample_name,"_nCounts.png"),plot = DP, height = h, width = w)
+DP <- SpatialFeaturePlot(object = visium.obj,features = "nFeature_Spatial",pt.size = 2)
+DP
+ggsave(filename = paste0("Visium_QC/",fl,"/",sample_name,"_nFeature.png"),plot = DP, height = h, width = w)
+
+```
+
+## Clustering
+
+1 assay is a tissue slide --> which has 4846 samples = filled spots in the static grid.
+
+`FindVariableFeatures()()` is a Seurat R package function that **identifies the most highly variable genes** (typically the top 2000) across single cells to highlight biological heterogeneity. 
+
+<span style="background-color: yellow">What does it mean that a gene is highly variable ? A highly variable gene is one whose expression level changes significantly across different cells, tissues, or experimental conditions, rather than remaining constant.</span>
+
+The `ScaleData()` function in Seurat R package is a critical pre-processing step for scRNA-seq data that centers and scales gene expression levels. **It shifts expression so the mean is 0 and variance is 1 across cells**, ensuring highly expressed genes do not dominate downstream analysis. It also supports removing unwanted technical variation via regression. 
+
+<span style="background-color: yellow">We normalize first to remove spot-level depth effects, then scale to ensure that all genes contribute equally to variance-based analyses like PCA and clustering.</span>
+
+`SCTransform()` is a Seurat function used in single-cell RNA-seq analysis to normalize data, stabilize variance, and identify highly variable features using regularized negative binomial regression. It effectively removes technical variation caused by sequencing depth (UMI counts) without relying on simple log-normalization, resulting in Pearson residuals that improve downstream clustering and differential expression. 
+```{r}
+# CLUSTERING AND DIM REDUCT
+visium.obj <- FindVariableFeatures(visium.obj)
+visium.obj <- ScaleData(visium.obj)
+
+# SCT v5 Calculation AND DIM REDUCT
+visium.obj <- SCTransform(visium.obj,vst.flavor="v2",return.only.var.genes = F,assay = "Spatial")
+
+visium.obj <- RunPCA(visium.obj, assay = "SCT", reduction.name = "pca")
+visium.obj <- FindNeighbors(visium.obj, assay = "SCT", reduction = "pca", dims = 1:50)
+visium.obj <- FindClusters(visium.obj, cluster.name = "seurat_cluster", resolution = 2)
+visium.obj <- RunUMAP(visium.obj, reduction = "pca", reduction.name = "umap", return.model = T, dims = 1:50)
+
+Idents(visium.obj) <- "seurat_cluster"
+IDP <- SpatialDimPlot(visium.obj,
+                      group.by = "seurat_cluster") 
+IDP
+
+#ggsave(filename = paste0("Visium_QC/",fl,"/",sample_name,"_Image_Dim_Plot_General.png"),plot = IDP, height = h, width = w,)
+```
+
+```{r}
+DP <- DimPlot(object = visium.obj,group.by = "seurat_cluster",pt.size = 0.5,reduction = "umap")
+DP <- DP +labs(title = "Clustering Visium - res:2")
+DP
+
+#ggsave(filename = paste0("Visium_QC/",fl,"/",sample_name,"_Dim_Plot_General.png"),plot = DP, height = 7, width = 7)
+
+#saveRDS(object = visium.obj,file = paste0("RDS/Visium/",fl,".RDS"))
+```
+```{r}
+p2 <- SpatialDimPlot(visium.obj, label = TRUE, label.size = 3)
+DP + p2
+```
+```{r}
+SpatialDimPlot(visium.obj, cells.highlight = CellsByIdentities(object = visium.obj, idents = c(2, 1, 4, 3,
+    5, 8)), facet.highlight = TRUE, ncol = 3)
+```
+
+```{r}
+SpatialDimPlot(visium.obj, interactive = TRUE)
+```
+
+
+```{r}
+de_markers <- FindMarkers(visium.obj, ident.1 = 5, ident.2 = 6)
+SpatialFeaturePlot(object = visium.obj, features = rownames(de_markers)[1:3], alpha = c(0.1, 1), ncol = 3)
+```
+```{r}
+features <- c("SAMD11", "NOC2L", "KLHL17", "PLEKHN1", "PERM1", "HES4")
+
+# Ridge plots - from ggridges. Visualize single cell expression distributions in each cluster
+RidgePlot(visium.obj, features = features, ncol = 2)
+```
+
+```{r}
+# Violin plot - Visualize single cell expression distributions in each cluster
+VlnPlot(visium.obj, features = features)
+```
+```{r}
+# Feature plot - visualize feature expression in low-dimensional space
+FeaturePlot(visium.obj, features = features)
+```
+
+```{r}
+# Dot plots - the size of the dot corresponds to the percentage of cells expressing the
+# feature in each cluster. The color represents the average expression level
+DotPlot(visium.obj, features = features) + RotatedAxis()
+```
+With this plot it seems that some features have almost no expression, but they do and we can see it more clearly in the next plot.
+```{r} 
+# Single cell heatmap of feature expression
+DoHeatmap(subset(visium.obj, downsample = 100), features = features, size = 3)
+```
+The identities on the side correspond to different cell type if we have them annotated. In our case they correspond to the results of the clustering, so it's the unsupervised gene expression agrupations. 
+```{r}
+# Plot a legend to map colors to expression levels
+FeaturePlot(visium.obj, features = "HES4")
+```
+
+```{r}
+FeaturePlot(visium.obj, features = "PERM1")
+```
+WOW this gene is seriously really expressed ! (it's irony)
+
+Let's look for the genes that are more differentially expressed in each cluster, so we don't loose time with these overly-specific-low-expressed and too-genral-among-clusters genes. They are really useful when your aim is biomarker discovery but here we only want to understand the biological meaning of different plots and the data.
+
+`FindAllMarkers()` is a Seurat function that systematically identifies differentially expressed genes (marker genes) for every identity class (cluster) in a scRNA-seq dataset compared to all other cells. 
+```{r}
+markers <- FindAllMarkers(visium.obj, assay = "Spatial", only.pos = TRUE) # only.pos = TRUE ==> only genes up in the cluster
+top1_per_cluster_p <- markers %>%
+  group_by(cluster) %>%
+  slice_min(order_by = p_val_adj, n = 1, with_ties = FALSE) %>%
+  ungroup()
+DotPlot(visium.obj, features = unique(top1_per_cluster_p$gene)) + RotatedAxis()
+```
+
+```{r}
+# Visualize co-expression of two features simultaneously
+FeaturePlot(visium.obj, features = c("NOC2L", "SLPI"), blend = TRUE)
+```
+
+
+For more information about how to access the Seurat object look at [this link](https://satijalab.org/seurat/articles/essential_commands#seurat-object-data-access) 
+
+For more information about how to plot this object look at [this link](https://satijalab.org/seurat/articles/spatial_vignette) it also has information about the preprocessing !
+
+For more information about deprecated and its substituting functions look at [this link](https://satijalab.org/seurat/articles/visualization_vignette) it also has information about the preprocessing !
+
+For more information about the whole preprocessing process focused on normalization look at [this link](https://satijalab.org/seurat/articles/sctransform_vignette) it also has information about the preprocessing !
+

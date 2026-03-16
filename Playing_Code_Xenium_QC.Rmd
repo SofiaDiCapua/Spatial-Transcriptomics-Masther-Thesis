@@ -1,0 +1,877 @@
+---
+title: "Playing_QC_Visium"
+author: "Sofia Di Capua"
+date: "2026-02-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# library(tidyverse)
+# library(ggridges)
+# library(edgeR)
+# library(Matrix)
+# library(reshape2)
+# library(S4Vectors)
+library(Seurat)
+library(dplyr)
+# library(SingleCellExperiment)
+# library(RColorBrewer)
+# library(data.table)
+# library(semla)
+# library(ggpubr)
+library(ggplot2)
+library(progressr)
+library(ggplotify)
+# library(BayesSpace)
+# library(mclust)
+library(viridis)
+library(patchwork)
+library(SummarizedExperiment)
+library(scuttle)
+```
+
+The aim of this R markdown is to experiment with the Xenium object for only one sample of the post treatment in the DUTRENEO clinical trial. From this code it will be generalized the final QC code for all the post treatment samples.
+
+# How does Xenium work ?
+
+First of all, transcripts are localized with subcellular precision. The rest of the process consists in: 
+1.- Tissue is stained (usually with DAPI for nuclei ± membrane markers)
+2.- Images are used to identify:
+  - Nuclei
+  - Cell boundaries (if membrane staining available)
+3.- A segmentation algorithm draws a boundary
+4.- Transcripts inside that boundary are assigned to that cell
+
+So “cell” = segmented spatial compartment.
+
+To access the different objects inside Xenium use: @ an object and $ inside that object. 
+For example to access gene names:  xenium.obj@assays$Xenium$counts
+
+First, which files are going to be used for Xenium Quality Control ? For Visum it was needed the `filtered_feature_bc_matrix.h5`, `molecule_info.h5` and `raw_feature_bc_matrix.h5`. But Xenium has a higher resolution than Xenium so more files are needed: `cell_feature_matrix` , `cells.csv.gz` and `cell_boundaries.csv.gz`.
+
+The gene count matrix is in the `cell_feature_matrix` h5 or tar.gz file. The cell metadata is in the `cells.csv.gz` or cells.parquet file. The cell segmentation polygon vertices are in the `cell_boundaries.csv.gz` or parquet file. The nucleus segmentation polygon vertices are in the `nucleus_boundaries.csv.gz` or parquet files. The transcript spot coordinates are in the `transcripts.csv.gz` or parquet file. The images for different histological stains are in the morphology_focus directory. 
+
+From the selected file ` output-XETG00289__0060279__DU53__20250508__150850`
+```{r}
+setwd("C:/Users/sofia/Documents/Health_Data_Science/TFM/Code/DUTRENEO") # In Rmd this line has to be executed in the terminal
+
+#file_list <- list.files("RAW/XENIUM") # Store in a variable the list of files
+
+options(future.globals.maxSize = 8000 * 1024^5) # For big size samples this parameter has to be modified or sent to the cluster
+future.seed=TRUE
+
+# DU68 does has empty files
+fl <- c("DU53")
+path <- paste0("RAW/XENIUM/",fl)
+```
+
+## Load the data
+
+```{r}
+###############################################################################
+# XENIUM FUNCTIONS MODIFICATION TO READ WITHOUT THE ERROR:
+# Error in data.table::fread(file.path(data.dir, "transcripts.csv.gz")) : 
+# File '/Users/ASUS/Desktop/IJC/AML_musmusculus/XENIUM/RAW_DATA/pvp25/transcripts.csv.gz' 
+# does not exist or is non-readable. getwd()=='C:/Users/ASUS/Desktop/IJC/AML_musmusculus/XENIUM'
+# #############################################################################
+
+knitr::opts_knit$set(root.dir = "C:/Users/sofia/Documents/Health_Data_Science/TFM/Code/DUTRENEO")
+ReadXenium <- function (data.dir, outs = c("matrix"), type = "centroids", 
+                        mols.qv.threshold = 20) {
+  type <- match.arg(arg = type, choices = c("centroids", "segmentations"), 
+                    several.ok = TRUE)
+  outs <- match.arg(arg = outs, choices = c("matrix"), 
+                    several.ok = TRUE)
+  outs <- c(outs, type)
+  has_dt <- requireNamespace("data.table", quietly = TRUE) && 
+    requireNamespace("R.utils", quietly = TRUE)
+  data <- sapply(outs, function(otype) {
+    switch(EXPR = otype, matrix = {
+      pmtx <- progressor()
+      pmtx(message = "Reading counts matrix", class = "sticky", 
+           amount = 0)
+      print(data.dir)
+      matrix <- suppressWarnings(Read10X(data.dir = file.path(data.dir, 
+                                                              "cell_feature_matrix/")))
+      pmtx(type = "finish")
+      matrix
+    }, centroids = {
+      pcents <- progressor()
+      pcents(message = "Loading cell centroids", class = "sticky", 
+             amount = 0)
+      if (has_dt) {
+        cell_info <- as.data.frame(data.table::fread(file.path(data.dir, 
+                                                               "cells.csv.gz")))
+      } else {
+        cell_info <- read.csv(file.path(data.dir, "cells.csv.gz"))
+      }
+      cell_centroid_df <- data.frame(x = cell_info$x_centroid, 
+                                     y = cell_info$y_centroid, cell = cell_info$cell_id, 
+                                     stringsAsFactors = FALSE)
+      pcents(type = "finish")
+      cell_centroid_df
+    }, segmentations = {
+      psegs <- progressor()
+      psegs(message = "Loading cell segmentations", class = "sticky", 
+            amount = 0)
+      if (has_dt) {
+        cell_boundaries_df <- as.data.frame(data.table::fread(file.path(data.dir, 
+                                                                        "cell_boundaries.csv.gz")))
+      } else {
+        cell_boundaries_df <- read.csv(file.path(data.dir, 
+                                                 "cell_boundaries.csv.gz"), stringsAsFactors = FALSE)
+      }
+      names(cell_boundaries_df) <- c("cell", "x", "y")
+      psegs(type = "finish")
+      cell_boundaries_df
+    }, stop("Unknown Xenium input type: ", otype))
+  }, USE.NAMES = TRUE)
+  return(data)
+}
+
+LoadXenium <- function (data.dir, fov = "fov", assay = "Xenium") 
+{
+  
+  data <- ReadXenium(data.dir = data.dir, type = c("centroids", 
+                                                   "segmentations"), )
+  segmentations.data <- list(centroids = CreateCentroids(data$centroids), 
+                             segmentation = CreateSegmentation(data$segmentations))
+  coords <- CreateFOV(coords = segmentations.data, type = c("segmentation", 
+                                                            "centroids"), assay = assay)
+  xenium.obj <- CreateSeuratObject(counts = data$matrix[["Gene Expression"]], 
+                                   assay = assay)
+  if ("Blank Codeword" %in% names(data$matrix)) 
+    xenium.obj[["BlankCodeword"]] <- CreateAssayObject(counts = data$matrix[["Blank Codeword"]])
+  else xenium.obj[["BlankCodeword"]] <- CreateAssayObject(counts = data$matrix[["Unassigned Codeword"]])
+  xenium.obj[["ControlCodeword"]] <- CreateAssayObject(counts = data$matrix[["Negative Control Codeword"]])
+  xenium.obj[["ControlProbe"]] <- CreateAssayObject(counts = data$matrix[["Negative Control Probe"]])
+  xenium.obj[[fov]] <- coords
+  return(xenium.obj)
+}
+
+xenium.obj <- LoadXenium(path, fov = "fov") 
+# If "Directory does not exist error" run it on the terminal and it will work
+```
+Should we load the cell area ? Marc says that he never uses it because with Xenium we have each cell separated, **we already have each cell's boundaries no there's no need to add the cell area**. Also it's straightforward to think that zones with mayor cellular density will have mayor amounts of transcripts.  
+
+
+## Preprocessing
+
+It's important to mention that the raw data and the preprocessed data are going to be saved in different objects inside the `Seurat` object. There's the raw and the preprocessed data. Further functions access one or another by default. For example a pot will access the raw data but the clusterization will access the preprocessed data, that's to say, the normalized data.
+
+There are two types of QC methods in Xenium depending on the library we want to use. For the Seurat object we base the QC in the mitocondrial RNA and for the SingleCellExperiment object we use the negative controls, genes and cells. To learn more we are going to make both !
+
+#### QC with Seurat
+A few QC metrics commonly used by the community include:
+- The number of unique genes detected in each cell.
+  · Low-quality cells or empty droplets will often have very few genes
+  · Cell doublets or multiplets may exhibit an aberrantly high gene count
+- Similarly, the total number of molecules detected within a cell (correlates strongly with unique genes)
+- The percentage of reads that map to the mitochondrial genome
+  · Low-quality / dying cells often exhibit extensive mitochondrial contamination
+  · We calculate mitochondrial QC metrics with the PercentageFeatureSet() function, which calculates the percentage of counts originating from a set of features
+  · We use the set of all genes starting with MT- as a set of mitochondrial genes
+```{r}
+# The [[ operator can add columns to object metadata. This is a great place to stash QC stats
+xenium.obj[["percent.mt"]] <- PercentageFeatureSet(xenium.obj, pattern = "^MT-")
+```
+
+```{r}
+# Show QC metrics for the first 5 cells
+head(xenium.obj@meta.data, 5)
+```
+
+In the example below, we visualize QC metrics, and use these to filter cells.
+```{r}
+# Changing the NaNs for 0 to make the plot
+xenium.obj$nFeature_Xenium[is.na(xenium.obj$nFeature_Xenium)] <- 0
+xenium.obj$nCount_Xenium[is.na(xenium.obj$nCount_Xenium)] <- 0
+xenium.obj$percent.mt[is.na(xenium.obj$percent.mt)] <- 0
+
+# Visualize QC metrics as a violin plot
+VlnPlot(xenium.obj, pt.size = 0.1, features = c("nFeature_Xenium", "nCount_Xenium", "percent.mt"), ncol = 3)
+VlnPlot(xenium.obj,features = c("nFeature_Xenium", "nCount_Xenium", "percent.mt"), ncol = 3,assay = "Xenium",group.by = "orig.ident",pt.size = 0.1) 
+```
+The last plot shows the distribution of the genes that are mitochondrial RNA, seeing that it's a flat line we can ensure that there are no mitochondrial genes in this data.
+```{r}
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+plot2 <- FeatureScatter(xenium.obj, feature1 = "nCount_Xenium", feature2 = "nFeature_Xenium")
+plot2
+```
+As there's is no mitocondrial RNA and there's no clear separation in the violin plots we will not substract any sample. (Maybe Ncount at 600 can make a good threshold but we can not confirm that is not given by chance biologically speaking)
+
+#### QC with Scuttle
+
+##### Negative controls
+According to the Xenium paper (Janesick2022-rp?), there are 3 types of controls:
+- probe controls to assess non-specific binding to RNA,
+- decoding controls to assess misassigned genes, and
+- genomic DNA (gDNA) controls to ensure the signal is from RNA.
+The negative controls give us a sense of the false positive rate.
+```{r}
+# Number of non-zero entries in each one of the probes
+# Count non-zero entries
+nz_blank  <- sum(xenium.obj$nCount_BlankCodeword != 0)
+nz_ctrl_p <- sum(xenium.obj$nCount_ControlProbe != 0)
+nz_ctrl_c <- sum(xenium.obj$nCount_ControlCodeword != 0)
+
+# Pretty print
+cat("========== Xenium Control Count Summary ==========\n")
+cat(sprintf("Non-zero cells (Blank Codeword):      %d\n", nz_blank))
+cat(sprintf("Non-zero cells (Control Probe):       %d\n", nz_ctrl_p))
+cat(sprintf("Non-zero cells (Control Codeword):    %d\n", nz_ctrl_c))
+cat("==================================================\n")
+```
+Now that we confirmed that they are not empty we can continue.
+
+The `addPerCellQCMetrics()` function in the `scuttle` package can conveniently add transcript counts, proportion of total counts, and number of features detected for any subset of features to the **SingleCellExperiment (SCE)** object. To use it on a Seurat object, we must first convert the Seurat object to an SCE object. 
+```{r}
+sfe <- as.SingleCellExperiment(xenium.obj)
+``` 
+
+```{r}
+# compute cell-level QC metrics
+sfe <- addPerCellQCMetrics(sfe)
+# identify low-quality cells by thresholding on
+# median absolute deviation (MAD) from the median
+ol <- perCellQCFilters(sfe)
+# tabulate # and % of cells discarded 
+# due to few counts/detected features
+data.frame(
+    check.names=FALSE,
+    `#`=apply(ol, 2, sum), 
+    `%`=round(100*apply(ol, 2, mean), 2))
+```
+Before proceeding to exclude any cells from downstream analyses, let’s first visualize the cells deemed to be of low quality in space alongside the underlying quality control metrics (total counts and detected features):
+```{r}
+.plt_xy <- function(spe, col) {
+    df <- as.data.frame(colData(spe))  # <- no spatialCoords()
+
+    aes_extra <- if (is.numeric(df[[col]])) {
+        theme(
+            legend.key.height = unit(1, "lines"),
+            legend.key.width  = unit(0.5, "lines")
+        )
+    } else {
+        list(
+            theme(legend.key.size = unit(0, "lines")),
+            guides(colour = guide_legend(override.aes = list(alpha = 1, size = 2)))
+        )
+    }
+
+    ggplot(df, aes(x_centroid, y_centroid, colour = .data[[col]])) +
+        coord_equal() + theme_void() + aes_extra +
+        geom_point(stroke = 0, size = 1/3)
+}
+sfe$ol <- ol$discard
+.plt_xy(sfe, "sum") +  
+    scale_color_viridis_c(
+        "# counts", 
+        trans="log1p",
+        breaks=range(sfe$sum), 
+        labels=c("low", "high")) +
+.plt_xy(sfe, "detected") +
+    scale_color_viridis_c(
+        "# features", 
+        breaks=range(sfe$detected), 
+        labels=c("low", "high")) +
+.plt_xy(sfe[, order(sfe$ol)], "ol") + 
+    scale_color_manual(
+        "low-quality",
+        labels=c("no", "yes"),
+        values=c("lavender", "purple"))
+```
+EL CODIGO DE ARRIBA NO VA A FUNCIONAR SOFI POR COMO HAS CARGADO LOS DATOS, HARIA FALTA USAR LA FUNCIÓN readXeniumSXE DEL TUTORIAL 24, MEJOR MIRATE EL 19 PRIMERO (CARGA DATASET PRO DEFAULT) Y YA VEREMOS SI EL 24 ES ÚTIL PARA ALGO DESPUES (QUIERO PLOT DEL TEJIDO A NIVEL CELULAS) No se puede visualizar algo en un objeto singleCell
+
+
+SHOULD WE REMOVE NEGATIVE PROBES ? No need to because they are separated from the counts
+
+MARC DICE que la segmentación no va a estar mal solo en una si está tan mal como para tener que quitarla se veria en todas las celulas no solo en una... Tiene sentido considerando como se hace la segmentación en Xenium ?
+
+
+```{r}
+coords <- as.data.frame(GetTissueCoordinates(xenium.obj[["fov"]]))
+
+ggplot(coords, aes(x = x, y = y)) +
+  geom_point(size = 0.15, alpha = 0.03) +   # adjust alpha/size if needed
+  coord_equal() +
+  theme_void() +
+  labs(title = "All cells (tissue shape from centroids)")
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+Counts --> plot distributions of count in each sample (color de histogram by sample) ==> One threshold 3-4 for all of the samples
+Percentage of negative probes above 10% bye bye --> have the number of negative probes per cell and watch the distribution and cropp  -------> En Xenium detectamos que hay cosas porque otras moleculas se enganchan a las de RNA y una vez enganchadas brillan. Las probes son unas cositas que no deberian engan charse a nada y que, cuando se enganchan a alguna molecula, brillan. Si estas brillan significa que algo a asalido mal y que lo que deberia haberse enganchado no se enganchó, suele pasar pero si pasa mucho dentro de una celula quiere decir que esta no se leyó bien.
+By regions if its detached --> isolated cells --> no neighbors in 50 microns (that would be cells outside the tissue)
+Visualize the number of counts per regions
+Fold = strangely shaped areas with high cell density but lower transcripts (when there's a fold the light can not get properly scanned so the machien can not properly read the transcripts located there)
+In Xenium they stain the nucleuos and use and algorithm to expand the cells according to that, if a cell is very separated from the other the area would be very big (segmentation not real) but that doesn't matter because the transcripts assigned to that cell would be completely from that cell 
+Neutrophil cell type have really low counts so if teh lower threshold is too high we can actually loose a completelly cell type
+```{r}
+# remove cells with 0 counts
+xenium.obj <- subset(xenium.obj, subset = nCount_Xenium > 5) 
+xenium.obj <- subset(xenium.obj, subset = nCount_Xenium < 2000) # Change based on the number of cells present in the samples, we want to get rid of the outliers
+
+# There are no samples with counts above 2000: subset(xenium.obj, subset = nCount_Xenium >= 2000)
+  
+# Annotate the dimensions of the sample to create with correct proportions the plots
+h <- (round(max(xenium.obj@images$fov@boundaries$centroids@coords[,1]))/1000)*2 # height
+w <- (round(max(xenium.obj@images$fov@boundaries$centroids@coords[,2]))/1000)*2 # width
+```
+# WHAT HAPPENED WITH THE MITOCONDRIAL ADN ?
+ Unlike scRNA-seq and sequencing-based ST, however, most imaging-based ST platforms do not measure the transcriptome, nor an “unbiased” sample of it, but rely on the design of gene panels. Hence, unlike in sequencing-based platforms, we may not have enough ribosomal or mitochondrial transcripts to use for computing QC metrics. However, imaging-based platforms provide a set of negative probes that can be used to check for aspecific RNA captures.
+
+But still some mito and ribo RNA could be in the sample, just not in a big enough amount to be usefull for QC.
+
+# WHY CUTTING AT 2000 COUNTS ?
+
+The counts per cell at Xenium are lower in general, outlier in the counts are artifacts introduce to ensure the analysis was made correctly, so an upper limit must be made just to be sure. 2000 is an arbitrary number than can be adjusted depending on the distribution (violin plot). 2000 is already a lot considering Xenium usual values, any pic at high count values in the violin plot should be errased, ex: a pick at 1500 counts is an indicator that the upper limit should be lowered.
+
+OJO RECOMIENTAN VER DONDE SE SITUAN ESTOS QUE QUEREMOS QUITAR EN EL TEJIDO PARA VER SI HAY UN PATRÓN
+
+In general, spatially organized clusters of excluded cells might indicate a bias towards excluding specific types of cells (e.g., some immune cells tend to be smaller or might otherwise contain fewer transcripts due to the panel design). So it is recommended to plot spatially the outliers to see if there's a pattern.
+
+# SOLO HAY 7 PACIENTES ?
+
+De momento sí hasta que Mustafa me de accesso.
+
+
+# NO TENEMOS NINGUN CELL AREA, DEBERIAMOS TENERLA ?
+La cell area esta en el archivo cells.csv.gz pero al cargarlo con la función especifica para nuestros datos (también pasaria con la función  por defecto) no se añadió la `cell_area`. La razón fue que no habia una necesidad de añadirla ja que se puede inferir del resto de metricas que tenemos.
+
+## Pretty plots 
+
+*nCount_Xenium* = How many RNA molecules (mRNAs) were captured and sequenced in that spot. 
+
+*nFeature_Xenium* = How many genes were captured and sequenced in that spot. (rows in count matrix)
+
+```{r}
+# Violin Count Plot
+# Visualize QC metrics as a violin plot
+
+VlnPlot(xenium.obj, features = "nCount_Xenium", pt.size = 0) + NoLegend()
+# These two plots return the same but the second one with the correct sample name
+vln_c <- VlnPlot(xenium.obj,features = "nCount_Xenium",assay = "Xenium",group.by = "orig.ident",pt.size = 0) +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 0,hjust = 0.5)) +
+  xlab("") +
+  scale_x_discrete(breaks=c("SeuratProject"),labels=c(fl))
+
+# Violin Feature Plot
+vln_f <- VlnPlot(xenium.obj,features = "nFeature_Xenium",assay = "Xenium",group.by = "orig.ident",pt.size = 0) +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 0,hjust = 0.5)) +
+  xlab("") +
+  scale_x_discrete(breaks=c("SeuratProject"),labels=c(fl))
+
+wrap_plots(vln_c, vln_f)
+```
+
+From the violin plot we can see that the ranges of counts are normal for Xenium, with low UMI counts being the usual.
+
+It seems that the function `SpatialFeaturePlot` for visium must be replaced by the more complex one `ImageFeaturePlot` for Xenium.
+```{r}
+Img_nCount <- ImageFeaturePlot(object = xenium.obj,
+                               features = "nCount_Xenium",
+                               fov = "fov",
+                               axes = T,
+                               size = 0.8,
+                               alpha = 1,
+                                 border.size =NA) +
+  scale_fill_viridis(option = "D", direction = 1)
+
+
+# nFeatures Plot
+Img_nFeature <- ImageFeaturePlot(object = xenium.obj,
+                                 features = "nFeature_Xenium",
+                                 fov = "fov",
+                                 axes = T,
+                                 size = 0.8,
+                                 alpha = 1,
+                                 border.size =NA) +
+  scale_fill_viridis(option = "D", direction = 1)
+
+wrap_plots(Img_nCount, Img_nFeature)
+```
+
+If we have white on this plot is due to a default parameter that sets the border of the cells too wide and blank so that we can only see white in the end. It can be fixed by writting `border.size =NA`.
+
+```{r}
+wrap_plots(vln_c, Img_nCount)
+```
+
+```{r}
+
+```
+## Preprocessing
+
+<span style="background-color: yellow">La normalización es dentro de cada cel·lulas, a Nivel de genes.
+El Scaling es dentro de cada tipo de celula, nivel celular/tejido.
+Sketch es una agrupación que maximiza la variancia en función del tipo de celula, no es tipo random sino que coje un poco de cada tipo para que esté bien distribuido.</span>
+
+```{r}
+xenium.obj <- NormalizeData(xenium.obj)
+# CLUSTERING AND DIM REDUCT
+xenium.obj <- FindVariableFeatures(xenium.obj)
+xenium.obj <- ScaleData(xenium.obj)
+# we select 50,0000 cells and create a new 'sketch' assay
+xenium.obj <- SketchData(
+  assay = "Xenium",
+  object = xenium.obj,
+  ncells = round(dim(xenium.obj@assays$Xenium$data)[2]/6), # Between 1/4 y 1/6 of the total amount of cells
+  method = "LeverageScore",
+  sketched.assay = "sketch"
+)
+```
+<span style="background-color: yellow">OJO DESPUES DE HACER EL SKETCH LA DISTRIBUCIÓN CAMBIA Y POR ESO TENEMOS QUE HACER EL SCALING DE NUEVOOOO !!!!</span>
+
+## Clustering
+```{r}
+# perform clustering workflow
+xenium.obj <- FindVariableFeatures(xenium.obj)
+xenium.obj <- ScaleData(xenium.obj)
+xenium.obj <- RunPCA(xenium.obj, assay = "sketch", reduction.name = "pca.sketch")
+xenium.obj <- FindNeighbors(xenium.obj, assay = "sketch", reduction = "pca.sketch", dims = 1:20)
+xenium.obj <- FindClusters(xenium.obj, cluster.name = "seurat_cluster.sketched", resolution = 2.6)
+xenium.obj <- RunUMAP(xenium.obj, reduction = "pca.sketch", reduction.name = "umap.sketch", return.model = T, dims = 1:20)
+xenium.obj <- ProjectData(
+  object = xenium.obj,
+  assay = "Xenium",
+  full.reduction = "full.pca.sketch",
+  sketched.assay = "sketch",
+  sketched.reduction = "pca.sketch",
+  umap.model = "umap.sketch",
+  dims = 1:50,
+  refdata = list(seurat_cluster.projected = "seurat_cluster.sketched")
+)
+DefaultBoundary(xenium.obj[["fov"]]) <- "segmentation" # This way the cells are outlined
+Idents(xenium.obj) <- "seurat_cluster.projected"
+IDP <- ImageDimPlot(xenium.obj,
+                      group.by = "seurat_cluster.projected",
+                      fov = "fov",
+                    border.color = NA,
+                      axes = T,
+                      size = 0.5,
+                      alpha = 1,
+                      border.size =0)
+
+IDP
+```
+```{r}
+DP <- DimPlot(object = xenium.obj,group.by = "seurat_cluster.projected",pt.size = 0.5,reduction = "full.umap.sketch")
+DP
+```
+
+We have made several transformations to the data so for safety we will save them into an RDS file so that we don't need to run the upper code to continue with the analysis.
+
+`SCTransform()` is a Seurat function used in single-cell RNA-seq analysis to normalize data, stabilize variance, and identify highly variable features using regularized negative binomial regression. It effectively removes technical variation caused by sequencing depth (UMI counts) without relying on simple log-normalization, resulting in Pearson residuals that improve downstream clustering and differential expression. 
+```{r}
+# SCT v5 Calculation AND DIM REDUCT
+xenium.obj <- SCTransform(xenium.obj,vst.flavor="v2",return.only.var.genes = F,assay = "Xenium")
+# Saving the file
+saveRDS(object = xenium.obj,file = paste0("QC/RDS/",fl,".RDS"))
+# If "Directory does not exist error" run it on the terminal and it will work
+```
+## Continuing with the processing
+FOV = Field Of View --> In transcriptomics, particularly in imaging-based spatial transcriptomics, the Field of View (FOV) refers to the specific, limited area of a tissue sample captured by a microscope camera in a single imaging frame.
+```{r}
+pvp <- readRDS(paste0("QC/RDS/",fl,".RDS"))
+
+DefaultBoundary(pvp[["fov"]]) <- "segmentation" # This way the cells are outlined
+# IF THE IMAGE PLOTS ARE NOT SHOWING ALL THE CELLS TRY THIS:
+##############################################################################
+pvp[["fov"]][["simplified.segmentations"]] <- Simplify(coords = pvp[["fov"]][["segmentation"]], tol = 3)
+DefaultBoundary(pvp[["fov"]]) <- "simplified.segmentations"
+##############################################################################
+# Annotate the dimensions of the sample to create with correct proportions the plots
+h <- (round(max(pvp@images$fov@boundaries$centroids@coords[,1]))/1000)*2 # height
+w <- (round(max(pvp@images$fov@boundaries$centroids@coords[,2]))/1000)*2 # width
+
+Img_nCount <- ImageFeaturePlot(object = pvp,
+                               features = "nCount_Xenium",
+                               fov = "fov",
+                               axes = T,
+                               size = 0.5,
+                               alpha = 1,
+                               border.size = NA) +
+  scale_fill_viridis(option = "D", direction = 1)
+Img_nCount
+```
+
+```{r}
+# nFeatures Plot
+Img_nFeature <- ImageFeaturePlot(object = pvp,
+                                 features = "nFeature_Xenium",
+                                 fov = "fov",
+                                 axes = T,
+                                 size = 0.5,
+                                 alpha = 1,
+                                 border.size = NA) +
+  scale_fill_viridis(option = "D", direction = 1)
+Img_nFeature
+```
+```{r}
+# Building one big QC table from the samples (in this Rmd, only 1 sample)
+all_meta <- data.frame()
+
+pvp <- readRDS(paste0("QC/RDS/",fl,".RDS"))
+pvp@meta.data$sample <- fl
+meta <- pvp@meta.data[,c("nCount_Xenium","nFeature_Xenium","sample")]
+all_meta <- rbind(all_meta,meta)
+
+
+# To ensure the right library is used based on the computer's OS
+safeBPParam <- function(nworkers) {
+  if (.Platform$OS.type=="windows") {
+    BiocParallel::SerialParam()
+  } else {
+    BiocParallel::MulticoreParam(nworkers)
+  }
+}
+
+```
+
+<span style="background-color: yellow">A **gene signature** is just: A small list of genes that, together, represent a biological identity or state.</span>
+
+Example:
+
+```r
+list_sigs[["Treg"]] <- c("FOXP3","IL2RA")
+```
+
+This means: If a cell expresses FOXP3 and IL2RA ==> It probably behaves like a regulatory *T cell*.
+
+In the following code we will define a list of gene signatures for anotating the previous plots. Using UCell which computes per-cell scores for each signature using a rank-based approach (robust to normalization differences). It will add columns to pvp@meta.data (defined in the chunk above) like: UCell_Th, UCell_Treg, UCell_Tumor, etc.
+```{r}
+#library(UCell)
+list_sigs <- list()
+list_sigs[["Th"]] <- c("CD3D","CD3E","CD4") # TH = T-cells
+list_sigs[["Treg"]] <-  c("FOXP3","IL2RA")
+list_sigs[["T_CD8"]] <-  c("CD8A")
+list_sigs[["Cytotoxic"]] <- c("GZMB","PRF1","NKG7")
+list_sigs[["Exhaustion"]]  <- c("PDCD1","CTLA4","LAG3")
+list_sigs[["Activation"]] <- c("CD69","IL7R")
+list_sigs[["Bcell"]] <- c("CD19","MS4A1")
+list_sigs[["Macro"]] <- c("CD68","CD163","MRC1")
+list_sigs[["DCs"]] <- c("FCER1A","CD1C")
+list_sigs[["Tumor"]] <- c("EPCAM","ERBB2")
+# list_sigs[["Stemness"]] <- c("SOX2", "MYC", "LGR5")
+# list_sigs[["Epithelial-to-Mesenchymal"]] <- c("SNAI1", "EGFR", "MET")
+# list_sigs[["ETM_plasticity"]] <- c("SNAI1", "EGFR", "MET", "ERBB2", "VWF")
+
+
+# pvp <- readRDS(paste0("QC/RDS/",fl,".RDS"))
+h <- (round(max(pvp@images$fov@boundaries$centroids@coords[,1]))/1000) # height
+w <- (round(max(pvp@images$fov@boundaries$centroids@coords[,2]))/1000) # width
+
+#for(i in names(list_sigs)){
+i = "Tumor" # To reduce the computational burden (just for testing)
+
+# Where the UCell adds its score
+pvp <- AddModuleScore(pvp, features = list(list_sigs[[i]]), name = i,assay = "Xenium",ctrl =15)
+pvp[[i]] <- pvp[[paste0(i,"1")]]
+
+list_sigs[[i]] %in% colnames(pvp)
+DefaultBoundary(pvp[["fov"]]) <- "segmentation" # This way the cells are outlined
+# IF THE IMAGE PLOTS ARE NOT SHOWING ALL THE CELLS TRY THIS:
+##############################################################################
+pvp[["fov"]][["simplified.segmentations"]] <- Simplify(coords = pvp[["fov"]][["segmentation"]], tol = 3)
+DefaultBoundary(pvp[["fov"]]) <- "simplified.segmentations"
+##############################################################################
+# Spatial Plots
+
+p <-  ImageFeaturePlot(pvp,
+                       features = paste0(i,"1"),
+                       fov = "fov",
+                       border.size = NA,
+                       max.cutoff = quantile(pvp@meta.data[[i]],0.95),
+                       min.cutoff = quantile(pvp@meta.data[[i]],0.05),
+                       axes = T) +
+  scale_fill_viridis(option = "D", direction = 1)
+ggsave(filename = paste0("Immune_signal/",fl,"/",i,".png"),
+           plot = p,
+           height = h*1.3,
+           width = w*1.3)
+#}
+ 
+
+```
+
+A **gene signature** is a predefined list of genes that represent a biological state, pathway, or cell identity. In your code, each element of list_sigs (e.g., "Treg" = c("FOXP3","IL2RA")) is a signature, and UCell uses these gene lists to calculate a per-cell score indicating how strongly each cell matches that signature.
+
+A **cell type** is a biological category of cells defined by their function, lineage, and overall gene expression profile (for example, a CD8 T cell or a macrophage). It is the label you might assign later (e.g., “this cell is a Treg”) by looking at those signature scores (and usually other evidence like clustering/markers) — UCell itself does not magically create cell types here.
+
+So: signatures = inputs (gene sets), UCell outputs = scores, and cell types = your interpretation/classification step using those scores.
+
+```{r}
+cell_types <- list()
+cell_types[["CD4_Tcells"]] <- c("CD3D","CD3E","CD4","FOXP3","IL2RA","CD69","IL7R")
+cell_types[["CD8_Tcells"]] <- c("CD3D","CD3E","CD8A","GZMB","PRF1","NKG7","PDCD1","CTLA4","LAG3")
+cell_types[["Bcells"]] <- c("CD19","MS4A1","CD79A")
+cell_types[["Plasma"]] <- c("MZB1","CD79A")
+cell_types[["M1"]] <- c("CD86","FCGR1A")
+cell_types[["M2"]] <- c("CD163","MRC1")
+cell_types[["DCs"]] <- c("CD1C","FCER1A","LILRA4")
+cell_types[["Mast"]] <- c("CPA3","KIT")
+cell_types[["Neutrophils"]] <- c("S100A12","FCGR3A")
+cell_types[["NKcells"]] <- c("NKG7","GNLY","KLRD1")
+cell_types[["Monocytes"]] <- c("CD14","FCGR3A")
+cell_types[["Fibroblast"]] <- c("ACTA2","PDGFRA","PDPN")
+cell_types[["CAFs"]] <- c("MFAP5","COL5A2","THY1")
+cell_types[["Endothelial"]] <- c("PECAM1","CD34","VWF","LYVE1","PROX1")
+cell_types[["Pericytes"]] <- c("ACTA2","PDGFRB")
+cell_types[["Epithelial"]] <- c("EPCAM","KRT7","KRT20","MKI67","PCNA","TOP2A")
+cell_types[["Secretory"]] <- c("CLCA1","TFF2","CHGA","GCG")
+cell_types[["Stem"]] <- c("LGR5","SOX2","TOP2A","CD34","KIT")
+cell_types[["Tumor"]] <- c("MKI67","PCNA","TOP2A","SNAI1","EGFR","MET","VWF","PECAM1","ANGPT2","CAV1")
+cell_types[["Proliferation"]] <- c("MKI67","PCNA","TOP2A")
+cell_types[["Plasticity"]] <- c("SNAI1","EGFR","MET")
+cell_types[["Angiogenesis"]] <- c("VWF","PECAM1","ANGPT2")
+#cell_types[["Hypoxia"]] <- c("CAV1") # Need more genes
+#cell_types[["Adipocytes"]] <- c("ADIPOQ","LEP") #Need more genes
+cell_types[["Smooth_muscle"]] <- c("ACTA2","MYH11","DES")
+#cell_types[["Hepatocytes"]] <- c("CYP3A4") # Need more genes
+
+
+
+# for(s in  file_list[c(15,17,18)]){ # why is he using only those ?
+#pvp <- readRDS(paste0("QC/RDS/",fl,".RDS"))
+h <- (round(max(pvp@images$fov@boundaries$centroids@coords[,1]))/1000) # height
+w <- (round(max(pvp@images$fov@boundaries$centroids@coords[,2]))/1000) # width
+DefaultBoundary(pvp[["fov"]]) <- "segmentation" # This way the cells are outlined
+# IF THE IMAGE PLOTS ARE NOT SHOWING ALL THE CELLS TRY THIS:
+##############################################################################
+pvp[["fov"]][["simplified.segmentations"]] <- Simplify(coords = pvp[["fov"]][["segmentation"]], tol = 3)
+DefaultBoundary(pvp[["fov"]]) <- "simplified.segmentations"
+##############################################################################
+
+i = "Tumor"
+#for(i in names(cell_types)){ # To reduce the computational burden (just for testing)
+pvp <- AddModuleScore(pvp, features = list(cell_types[[i]]), name = i,assay = "Xenium",ctrl =15)
+pvp[[i]] <- pvp[[paste0(i,"1")]]
+
+cell_types[[i]] %in% colnames(pvp)
+# Spatial Plots
+
+p <-  ImageFeaturePlot(pvp,
+                       features = paste0(i,"1"),
+                       fov = "fov",
+                       border.size = NA,
+                       max.cutoff = quantile(pvp@meta.data[[i]],0.95),
+                       min.cutoff = quantile(pvp@meta.data[[i]],0.05),
+                       axes = T) +
+  scale_fill_viridis(option = "D", direction = 1)
+ggsave(filename = paste0("CellTypes/",fl,"/",i,".png"),
+           plot = p,
+           height = h*1.3,
+           width = w*1.3)
+
+#}
+
+
+```
+Now we will do a heatmap of the average expression data, but first we must get that kind of data. To do so we will go from having all the cells with their expression values to a Genes × Clusters matrix where each value = average expression of that gene in that cluster. 
+```{r}
+###################
+# AVG EXPRESSION  #
+###################
+# Getting the Genes x Clusters matrix 
+avg_exp <- Seurat::AverageExpression(
+  pvp, 
+  assays = "SCT", 
+  group.by = "seurat_cluster.projected",  # Replace with your cluster column name
+  slot = "data"                  # Use "data" for log-normalized counts
+)$SCT
+# Compute average signature score per cluster
+celltype_avg <- sapply(cell_types, function(genes) {
+  genes_present <- intersect(genes, rownames(avg_exp))
+  if (length(genes_present) == 0) return(rep(NA, ncol(avg_exp)))
+  colMeans(avg_exp[genes_present, ])  # Average across signature genes
+})
+
+# Transpose to celltypes (rows) x clusters (columns) --> 4 easier reading heatmap
+heatmap_data <- t(celltype_avg)
+# Remove empty signatures
+heatmap_data <- heatmap_data[rowSums(is.na(heatmap_data)) < ncol(heatmap_data), ]
+
+library(pheatmap)
+
+pheatmap(
+  mat = heatmap_data,
+  scale = "row",               # Z-score normalize rows (celltypes)
+  cluster_rows = TRUE,         # Cluster celltypes
+  cluster_cols = TRUE,         # Cluster clusters
+  color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+  main = "Cell Type Signature Scores by Cluster",
+  fontsize_row = 8,
+  fontsize_col = 8,
+  angle_col = 45
+)
+```
+Here is the heatmap for the different celltypes using the score per cell type computed above. 
+
+The following code (1) computes Seurat AddModuleScore signature scores for each cell, (2) averages those scores per cluster and draws a heatmap, then (3) uses the top-scoring signatures per cluster to assign a coarse label (“Tumor”, “Immune”, “TME”, etc.) and finally plots the spatial distribution of those labels.
+```{r}
+###################
+# ADDMODULE SCORE #
+###################
+library(pheatmap)
+
+# Define categories of signatures used later for rule-based labeling
+Immune <- c("Neutrophils","M1","M2","Monocytes","DCs","NKcells","CD4_Tcells","CD8_Tcells","Bcells","Plasma","Cytotoxic","Exhaustion",
+            "Activation")
+Tumor <- c("Tumor","Angiogenesis","CAFs","Proliferation","Plasticity","Stem","Hypoxia","Epithelial_to_Mesenchymal","ETM_plasticity",
+           "Stemness")
+TME <- c("Endothelial","Secretory","Fibroblast","Pericytes","Smooth_muscle","Epithelial","Mast")
+
+#file_list <- gsub(pattern = ".RDS",replacement = "",list.files("RDS/")) # Store in a variable the list of files
+#for(s in  file_list){
+#pvp <- readRDS(paste0("QC/RDS/",fl,".RDS"))
+# Compute module scores per cell
+# Add scores to metadata
+pvp <- AddModuleScore(
+  pvp,
+  features = cell_types,
+  name = names(cell_types), ctrl = 15
+)
+
+# Average those per-cell scores per cluster
+heatmap_data <- pvp@meta.data %>%
+  group_by(seurat_cluster.projected) %>%  # Replace with your cluster column name
+  summarize(
+    CD4_Tcells = mean(CD4_Tcells1),
+    CD8_Tcells = mean(CD8_Tcells2),
+    Cytotoxic = mean(Cytotoxic3),
+    Exhaustion = mean(Exhaustion4),
+    Activation = mean(Activation5),
+    Tumor = mean(Tumor6),
+    Stemness = mean(Stemness7),
+    Epithelial_to_Mesenchymal = mean(Epithelial_to_Mesenchymal8),
+    ETM_plasticity = mean(ETM_plasticity9),
+    Bcells = mean(Bcells10),
+    Plasma = mean(Plasma11),
+    M1 = mean(M112),
+    M2 = mean(M213),
+    DCs = mean(DCs14),
+    Mast = mean(Mast15),
+    Neutrophils = mean(Neutrophils16),
+    NKcells = mean(NKcells17),
+    Monocytes = mean(Monocytes18),
+    Fibroblast = mean(Fibroblast19),
+    CAFs = mean(CAFs20),
+    Endothelial = mean(Endothelial21),
+    Pericytes = mean(Pericytes22),
+    Epithelial= mean(Epithelial23),
+    Secretory =  mean(Secretory24),
+    Adipocytes = mean(Adipocytes25),
+    Smooth_muscle = mean(Smooth_muscle26),
+    Proliferation = mean(Proliferation27),
+    Plasticity = mean(Plasticity28),
+    Stem = mean(Stem29),
+    Angiogenesis = mean(Angiogenesis30),
+    Hypoxia = mean(Hypoxia31)
+    ) %>%
+  tibble::column_to_rownames("seurat_cluster.projected") %>%
+  t()  # Transpose to celltypes (rows) x clusters (columns)
+
+
+hp <- pheatmap(
+  mat = heatmap_data,
+  scale = "column",               # Z-score normalize rows (celltypes)
+  cluster_rows = TRUE,         # Cluster celltypes
+  cluster_cols = TRUE,         # Cluster clusters
+  color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+  main = "Cell Type Signature Scores by Cluster",
+  fontsize_row = 8,
+  fontsize_col = 8,
+  angle_col = 45
+)
+# Create a coarse annotation per cluster using a “top signatures” rule
+pvp$General_Annotation <- ""
+for(i in unique(pvp$seurat_cluster.projected)){
+  q9 <- quantile(heatmap_data[,i],0.85)
+  high_expressed<- names(which(heatmap_data[,i]>q9))
+  # The classification logic:
+  if(any(high_expressed %in% Tumor)){
+    if(any(high_expressed %in% Immune)){
+      # Assign cluster to Immune-Active
+      pvp$General_Annotation[which(pvp$seurat_cluster.projected == i)] <- "Immune_Tumor"
+    }else if(any(high_expressed %in% TME)){
+      pvp$General_Annotation[which(pvp$seurat_cluster.projected == i)] <- "Tumor_Border"
+    }else{
+      pvp$General_Annotation[which(pvp$seurat_cluster.projected == i)] <- "Tumor"
+    }
+  }else if(any(high_expressed %in% Immune)){
+    if(any(high_expressed %in% TME)){
+      pvp$General_Annotation[which(pvp$seurat_cluster.projected == i)] <- "Immune_TME"
+    }else{
+      pvp$General_Annotation[which(pvp$seurat_cluster.projected == i)] <- "Immune"
+    }
+  }else{
+    pvp$General_Annotation[which(pvp$seurat_cluster.projected == i)] <- "TME"
+  }
+
+}
+dp <- ImageDimPlot(pvp,
+                   group.by = "General_Annotation",
+                   fov = "fov",
+                   axes = T,
+                   size = 0.5,
+                   alpha = 1,
+                   border.size =0)
+h <- (round(max(pvp@images$fov@boundaries$centroids@coords[,1]))/1000) # height
+w <- (round(max(pvp@images$fov@boundaries$centroids@coords[,2]))/1000) # width
+#ggsave(filename = paste0("General_",s,".png"),plot = dp, height = h, width = w)
+
+# hp <- as.ggplot(hp) 
+# hp <- hp  + theme_bw()  
+# ggsave(filename = paste0("CellTypes/",s,".png"),plot = hp, height = 7, width = 10)
+#}
+
+
+```
+
+This last snippet of code retrieves a curated database of **ligand–receptor interactions** and filters it to keep only well-supported interactions (those backed by multiple curation efforts, references, and resources), increasing biological confidence. It then restricts the interaction list to ligand and receptor genes that are actually detected in your dataset (`pvp`), ensuring the analysis focuses only on biologically measurable signals in your sample. Biologically, this prepares a high-confidence set of potential **cell–cell communication interactions** that could occur between the cell populations in your Xenium tissue.
+
+```{r}
+library(OmnipathR)
+lr <- curated_ligand_receptor_interactions()
+lr
+lr <- lr[which(lr$curation_effort>1),]
+lr <- lr[which(lr$n_references>1),]
+lr <- lr[which(lr$n_resources>1),]
+
+
+genes <- unique(lr$source_genesymbol,lr$target_genesymbol)
+lr<- lr[which(unique(lr$source_genesymbol,lr$target_genesymbol) %in% unique(rownames(pvp)) ),]
+saveRDS(object = lr,file = "LR_genes.RDS")
+```
+
+
+For more overall information about general spatial transcriptomics data analysis (Visium, Xenium, CosMx) look at [this link](https://bioconductor.org/books/release/OSTA/pages/img-quality-control.html) 
+
+For more information about Xenium workflow look at [this link](https://lmweber.org/OSTA/pages/img-workflow-xenium.html) it also has information about the **annotation** !
+
+For more information about reading Xenium into different objects look at [this link](https://bioconductor.statistik.tu-dortmund.de/packages/3.23/bioc/vignettes/SpatialExperimentIO/inst/doc/SpatialExperimentIO.html#:~:text==%20%22cell_feature_matrix%22)-,3.2%20Read%20Xenium%20as%20a%20SingleCellExperiment%20object,SCE%20object%20with%20248%20genes.&text=%23%23%20class:%20SingleCellExperiment%20%23%23%20dim,install(%22ggspavis%22)%20.) 
+
+For more information about QC made with Seurat object look at [this link](https://satijalab.org/seurat/articles/pbmc3k_tutorial.html) it also has information about assigning cell type !
+
+For more information about general QC made with SingleCellExperiment object look at [this link](https://bioconductor.org/books/release/OSTA/pages/img-quality-control.html#visualization) 
+Overly strict QC with really nice plots, look at [this link](https://pachterlab.github.io/voyager/articles/vig5_xenium.html#negative-controls) 
+
+
+
+IDEA PARA RESOLVER DATA IMBALANCE PROBLEM: Train the NN only on the majority class so that it can detect the other class as non-normal or not-majority-class
