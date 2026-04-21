@@ -1,5 +1,5 @@
 # Spatial-Transcriptomics-Masther-Thesis
-This repository contains the computational analysis developed for my Master's thesis on spatial transcriptomics in bladder cancer. The project focuses on understanding the cellular composition and spatial organization of the tumor microenvironment using high-resolution spatial gene expression data.
+This repository contains the computational analysis developed for my Master's thesis on spatial transcriptomics in bladder cancer. The project focuses on understanding the cellular composition and spatial organization of the tumor microenvironment using high-resolution spatial gene expression data. More concretely, this involves analyzing post-treatment samples to compare tumor evolution across patients and treatment types.
 
 The workflow includes data preprocessing, quality control, clustering, and cell type annotation, integrating tools from the Seurat ecosystem and publicly available marker databases (e.g., PanglaoDB). Special emphasis is placed on identifying distinct cellular populations and their spatial relationships within tumor tissue, which may provide insights into tumor heterogeneity and immune infiltration.
 
