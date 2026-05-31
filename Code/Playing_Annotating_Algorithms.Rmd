@@ -1,0 +1,2087 @@
+---
+title: "Playing_Annotation_Algorithms"
+author: "Sofia Di Capua"
+date: "2026-03-02"
+output: html_document
+---
+```{r}
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(progressr)
+library(ggplotify)
+library(viridis)
+library(patchwork)
+library(BiocParallel)
+library(scrapper)
+library(cowplot)
+library(knitr)
+library(dplyr)
+library(celldex)
+library(ensembldb)
+library(SingleR)
+library(clustree)
+library(ggtext)
+library(tidyverse)
+library(pheatmap) 
+library(clustree)
+library(SingleR)
+library(UCell)
+
+# To make nice prints:
+log_msg <- function(...) {
+  cat(sprintf("[%s] ", format(Sys.time(), "%H:%M:%S")),
+      sprintf(...), "\n", sep = "")
+}
+```
+# Loading data (not modified to work here)
+```{r}
+#file_list <- gsub(pattern = ".RDS","",list.files("RDS/"))
+#for(fl in file_list){
+setwd("C:/Users/sofia/Documents/Health_Data_Science/TFM/Code/DUTRENEO") # In Rmd this line has to be executed in the terminal
+
+fl <- c("DU53")
+path <- paste0("QC/",fl)
+
+pvp <- readRDS(paste0("C:/Users/sofia/Documents/Health_Data_Science/TFM/Code/DUTRENEO/QC/DU53/RDS/",fl,".rds")) # In Rmd this line has to be executed in the terminal
+
+path <- paste0("Annotations/",fl) # So the modifications in the RDS file are saved in a different place
+
+DefaultBoundary(pvp[["fov"]]) <- "segmentation" # This way the cells are outlined
+# Annotate the dimensions of the sample to create with correct proportions the plots
+h <- (round(max(pvp@images$fov@boundaries$centroids@coords[,1]))/1000)*2 # height
+w <- (round(max(pvp@images$fov@boundaries$centroids@coords[,2]))/1000)*2 # width
+```
+
+# Annotation algorithms
+
+There are two possible approaches of doing cell type annotation: using suppervised or unsupervised methods. Of course there are many different libraries that offer many different algorithms for both methods but, for the sake of simplicity, we will only consider the ones offered by the libraries used in the QC exploration, Seurat and SingleExperiment but now we will also consider Single R.
+
+It's important to mention that according to our data we should not do supervised methods ortherwise it will introduce huge bias. In other words, if you do not have a reference made specifically for your sample and protocol you should not use a reference; it is really important that age, sex, tissue, biologucal surroundings, etc are the same in oth sample and reference. So **supervised methods here will only be for academical purposes and not executed**. With the exception of SingleR algorithm which performs unbiased identification of cell types in single cell transcriptomics data based on built-in
+reference transcriptomes of pure cell types.                                 
+
+## Unsupervised
+
+#### Spatial Experiment object
+If it is a `Spatial Experiment` object you can have this unsupervised algorithm:
+```r
+library(scran)
+# shared nearest-neighbor (SNN) graph based on 
+# cell-to-cell Jaccard similarity in PC space
+g <- buildSNNGraph(pvp, use.dimred="PCA", type="jaccard", BPPARAM=bp)
+# community detection using Leiden algorithm
+k <- cluster_leiden(g, objective_function="modularity", resolution=0.7)
+table(sub$Leiden <- factor(. <- k$membership, labels=letters[seq_along(unique(.))]))
+```
+#### Seurat object
+
+The same as before can be done with `Seurat` but some changes in the code would be needed:
+The  applied in the quality control code applied by default the Louvain algorithm to iteratively group cells together. However, Leiden is generally considered the **current best-practice choice for graph/community detection clustering** in scRNA-seq because it fixes known issues of Louvain (most famously: Louvain can produce disconnected communities), and tends to be more stable/robust. Many best-practice guides explicitly recommend Leiden over Louvain nowadays.
+
+In Seurat, Leiden is algorithm = 4 in FindClusters() (after building the neighbor graph):
+```{r}
+pvp$louvain_clusters <- pvp$seurat_cluster.sketched # Saving the QC clustering
+# Leiden clustering
+pvp <- FindClusters(pvp, cluster.name = "seurat_cluster.sketched", graph.name = "sketch_nn", algorithm = 4, resolution = 2.6)
+pvp$leiden_clusters <- pvp$seurat_cluster.sketched
+DimPlot(pvp, group.by = "louvain_clusters", label = TRUE)
+DimPlot(pvp, group.by = "leiden_clusters", label = TRUE)
+```
+
+```{r}
+# Saving pvp data
+saveRDS(pvp, file = paste0(path,"/RDS/",fl,".rds"))
+log_msg("RDS file saved.")
+```
+
+If it is a `Seurat` object the unsupervised algorithms will be **based on the Principal Components** extracted from performing the PCA. **But after getting the clusters (with `FindClusters()` function) it is advised to find markers (genes) that define clusters via differential expression (DE)**. Seurat by default, it identifies positive and negative markers of a single cluster (specified in ident.1), compared to all other cells. `FindAllMarkers()` automates this process for all clusters, but you can also test groups of clusters vs. each other, or against all cells.
+```{r echo=FALSE}
+# find all markers of cluster 2
+cluster2.markers <- FindMarkers(pvp, ident.1 = 2)
+head(cluster2.markers, n = 5)
+```
+
+```{r echo=FALSE}
+# find all markers distinguishing cluster 5 from clusters 0 and 3
+cluster5.markers <- FindMarkers(pvp, ident.1 = 5, ident.2 = c(0, 3))
+head(cluster5.markers, n = 5)
+```
+
+```{r echo=FALSE}
+###############################################################################
+#        If the RDS was not saved
+###############################################################################
+# find markers for every cluster compared to all remaining cells, report only the positive
+# ones
+pvp.markers <- FindAllMarkers(pvp, only.pos = TRUE)
+# Saving the results in the Seurat object and then saving it locally
+pvp@misc$markers <- pvp.markers
+# Saving pvp data
+saveRDS(pvp, file = paste0(path,"/RDS/",fl,".rds"))
+log_msg("RDS file saved.")
+
+###############################################################################
+#        If the RDS was saved
+# IMPORTANT: FIND ALL MARKERS WAS MADE USING LOUVAIN ALGORITHM
+###############################################################################
+#pvp <- readRDS(paste0(path,"/RDS/",fl,".rds")) # In Rmd this line has to be executed in the terminal
+#pvp.markers = pvp@misc$markers
+
+pvp.markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(abs(avg_log2FC) > 1)
+```
+
+```{r}
+FeaturePlot(pvp, features = c("DUSP2", "GZMK", "PRF1", "NKG7", "CD8A", "CCL5", "CD69", "CD247","CD2"))
+```
+`DoHeatmap()` generates an expression heatmap for given cells and features. In this case, we are plotting the top 10 markers (or all markers if less than 10) for each cluster.
+
+```{r}
+# To solve the error non-unique values when setting 'row.names' 
+# The error was due to NaNs cause by it not locking at the sketched data (the one that was clusterized)
+# When looking at the results of the clustering the full data didn't have clusters assigns to all the entries
+DefaultAssay(pvp) <- "sketch" 
+
+top5 <- pvp@misc$markers %>% 
+  group_by(cluster) %>% 
+  dplyr::filter(abs(avg_log2FC) > 1) %>% 
+  slice_max(order_by = abs(avg_log2FC), n = 5, with_ties = FALSE) %>% 
+  ungroup()
+
+genes <- unique(top5$gene)
+
+p <- DotPlot(object = pvp, features = genes,group.by = "leiden_clusters") + 
+  RotatedAxis() + 
+  theme(
+    axis.text.x = element_text(size = 8, angle = 90, hjust = 1),
+    axis.text.y = element_text(size = 8)
+  )
+
+ggsave(filename = paste0(path,"/dotplot_wide.png"), plot = p, width = 30, height = 12, dpi = 300)
+```
+If the plots show that some genes are highly expressed for unique cell types we can check and use them for a supervised analysis after.
+
+The used filters (not extracted from anywhere, just us being restrictive so we can work faster):
+abs(avg_log2FC) > 0.25
+Keeps genes with fairly strong upregulation in that cluster. Since log2FC of 1 means about a 2-fold difference, this is a fairly strict effect-size cutoff. In single-cell RNA-seq (e.g., Seurat), a lower threshold of 0.25 is commonly used, while intermediate studies often use 0.58 ($\approx$1.5-fold change).
+
+p_val_adj < 0.05
+Keeps genes that are statistically significant after multiple-testing correction.
+
+pct.1 > 0.2
+Keeps genes expressed in at least 20% of cells in that cluster, which helps remove genes that look significant only because of a tiny number of cells.
+
+```{r, out.width="70%"}
+knitr::include_graphics("Annotations/DU53/dotplot_wide.png")
+``` 
+
+```{r}
+marker_table_summary <- pvp@misc$markers %>%
+  dplyr::filter(abs(avg_log2FC) > 0.25, p_val_adj < 0.05, pct.1 > 0.2) %>%
+  group_by(cluster) %>%
+  arrange(desc(abs(avg_log2FC)), .by_group = TRUE) %>%
+  summarise(
+    top_markers = paste(head(gene, 10), collapse = ", "),
+    n_markers = n(),
+    .groups = "drop"
+  )
+
+marker_table_summary
+```
+
+Depending on the case of the dataset, we can use canonical markers to easily match the unbiased clustering to known cell types. What we are going to do here is use **PanglaoDB** to get a preliminary cell type per cluster, then we are going to make confirm or change our preliminary cell type with the **Go terms** of each top 5 gene per cluster and finally we are going to confirm it with **Gene Cards** by checking if the genes are related with the cellular function of the suspected cell type.
+
+However if we still are not sure about one cellular type there's still the supervised method's result we are going to compare to these ones.
+
+**With PanglaoDB:**
+
+Let's make use of the `getMarkers()` function of rPanglaoDB (https://github.com/dosorio/rPanglaoDB)
+   
+```{r}
+#install.packages("rPanglaoDB")
+library(rPanglaoDB)
+
+# Example input:
+# df_top10 has columns: cluster, gene
+# one row per gene, 10 genes per cluster
+
+get_top3_from_getMarkers <- function(genes, cluster) {
+    res <- tryCatch({
+    rPanglaoDB::getMarkers(include = genes) %>%
+    dplyr::filter(Specie == "Homo sapiens")
+  }, error = function(e) {
+    message("getMarkers failed for: ", paste("Cluster: ", cluster, "\n Genes: " ,genes, collapse = ", "))
+    return(NULL)
+  })
+
+  if (is.null(res) || nrow(res) == 0) {
+    return(data.frame(cell_type = NA_character_, n_hits = 0))
+  }
+  res %>%
+    count(`Cell-Type`, sort = TRUE) %>%
+    slice_head(n = 3) %>%
+    rename(cell_type = `Cell-Type`, n_hits = n)
+}
+
+top3_list <- marker_table_summary %>%
+  group_by(cluster) %>%
+  group_split() %>%
+  lapply(function(x) {
+    genes <- head(unlist(strsplit(x$top_markers[1], ",\\s*")), 4)
+    out <- get_top3_from_getMarkers(genes, x$cluster)
+    out$cluster <- unique(x$cluster)
+    out
+  })
+
+top3_results <- bind_rows(top3_list) %>%
+  select(cluster, everything())
+
+top3_results
+```
+
+```{r}
+# We search the missing ones manually
+top3_results.loc[top3_results["cluster"] == 0, "cell_type"] = "Smooth muscle"
+top3_results.loc[top3_results["cluster"] == 1, "cell_type"] = "T cells"
+top3_results.loc[top3_results["cluster"] == 4, "cell_type"] = "T cells"
+top3_results.loc[top3_results["cluster"] == 5, "cell_type"] = "Fibroblasts"
+top3_results.loc[top3_results["cluster"] == 6, "cell_type"] = "Epithelial cells"
+top3_results.loc[top3_results["cluster"] == 7, "cell_type"] = "Fibroblasts"
+top3_results.loc[top3_results["cluster"] == 8, "cell_type"] = "T cells"
+top3_results.loc[top3_results["cluster"] == 9, "cell_type"] = "T Cells"
+top3_results.loc[top3_results["cluster"] == 13, "cell_type"] = "Plasma cells"
+top3_results.loc[top3_results["cluster"] == 14, "cell_type"] = "Dendritic cells"
+top3_results.loc[top3_results["cluster"] == 15, "cell_type"] = "Non-accepted Erythroid-like (globulos rojos)"
+top3_results.loc[top3_results["cluster"] == 16, "cell_type"] = "Smooth muscle"
+top3_results.loc[top3_results["cluster"] == 17, "cell_type"] = "Epithelial cells"
+top3_results.loc[top3_results["cluster"] == 23, "cell_type"] = "Fibroblasts"
+top3_results.loc[top3_results["cluster"] == 24, "cell_type"] = "Plasma cells"
+top3_results.loc[top3_results["cluster"] == 25, "cell_type"] = "Mast cells / Neutrophils"
+top3_results.loc[top3_results["cluster"] == 26, "cell_type"] = "Endothelial cells"
+top3_results.loc[top3_results["cluster"] == 28, "cell_type"] = "Fibroblasts"
+top3_results.loc[top3_results["cluster"] == 29, "cell_type"] = "Smooth muscle"
+top3_results.loc[top3_results["cluster"] == 32, "cell_type"] = "B Cells"
+top3_results.loc[top3_results["cluster"] == 33, "cell_type"] = "Endothelial cells"
+top3_results.loc[top3_results["cluster"] == 39, "cell_type"] = "Fibroblasts"
+top3_results.loc[top3_results["cluster"] == 42, "cell_type"] = "Non-accepted Erythroid-like (globulos rojos)"
+top3_results.loc[top3_results["cluster"] == 43, "cell_type"] = "Non-accepted Erythroid-like (globulos rojos)"
+top3_results.loc[top3_results["cluster"] == 44, "cell_type"] = "Smooth muscle"
+top3_results
+
+# TO DOOO: CHOOSING ONE OF THE TOP 3 LABELS
+
+#pvp@misc$PanglaoDB_Annotation = top3_results
+#saveRDS(pvp, file = paste0(path,"/RDS/",fl,".rds"))
+```
+
+The problem that we are facing yet is that there are some cluster with 3 options and we have no metric to choose one of them, because PanglaoDB doesn't provide one. Also this method requires lots of supervising per sample, so it wouldn't be appropiate for the 15 samples we have. It's better if we look at other methods now and leave this one as incomplete as it requires an extremely long unnecessary review time.
+
+Moreover, the literature specifies that the supervised annotating is better than manually doing it, and that from all the unsupervised methods, SingleR is the best one currently. Despite not having a renference in the Dutreneo paper they could still use this method which is going to be explained in the next section.
+
+How to change the names of the clusters:
+```r
+new.cluster.ids <- c("Naive CD4 T", "CD14+ Mono", "Memory CD4 T", "B", "CD8 T", "FCGR3A+ Mono",
+    "NK", "DC", "Platelet")
+names(new.cluster.ids) <- levels(pvp)
+pvp <- RenameIdents(pvp, new.cluster.ids)
+DimPlot(pvp, reduction = "umap", label = TRUE, pt.size = 0.5) + NoLegend()
+```
+
+## Supervised
+
+Despite having said before that supervised methods can not be used in this data due to the lack of reference, using SingleR is correct here as they use pure cell types trasncriptomes. It is no going to be as accurate in cell type prediction as it would be with a reference but be can be certain that is going to be unbiased.    
+
+#### Spatial Experiment object
+First, the `Spatial Experiment` object algorithms.
+
+For comparison, we annotate the Xenium data using a label transfer approach, `SingleR`, which relies on labeled scRNA-seq data to compute references profiles and transfers labels based on the rank correlation between observed (here, Xenium) and reference (scRNA-seq) expression profiles.
+
+First, we retrieve a matching (Chromium) scRNA-seq dataset, which includes low- (Level1) and high-resolution (Level2) annotations of cells into 9 and 31 subpopulations, respectively. This is the whole loading and preprocessing of the reference dataset in the Spatial Experiment object annotation tutorial (third link in the end) :
+
+```r
+# retrieve dataset from OSF repository
+id <- "Chromium_HumanColon_Oliveira"
+pa <- OSTA.data_load(id)
+dir.create(td <- tempfile())
+unzip(pa, exdir=td)
+# read into 'SingleCellExperiment'
+sce <- read10xCounts(list.files(td, "h5$", full.names=TRUE))
+cd <- read.csv(list.files(td, "cell_meta", full.names=TRUE))
+colData(sce) <- cbind(colData(sce), cd[, -1])
+table(sce$Level1) # tabulate low-res. labels
+ncol(sce) # overall number of cells
+# exclude cells deemed to be of low-quality
+sce <- sce[, sce$QCFilter == "Keep"]
+# subset cells from same patient
+sce <- sce[, grepl("P2", sce$Patient)]
+# realize count matrix
+assay(sce) <- as(assay(sce), "dgCMatrix")
+# log-library size normalization
+sce <- logNormCounts(sce)
+# restrict to Xenium targets
+sce <- sce[rowData(sce)$ID %in% rowData(sub)$ID, ]
+# set gene symbols as feature names
+rownames(sce) <- rowData(sce)$Symbol
+```
+
+The dataset used in the DUTRENEO paper was “BlueprintEncodeData” reference dataset which included a number of different cell types. To minimize false positive assignments, we restricted the “main labels” of the reference to cell types that may populate bladder tumours: epithelial cells, fibroblasts, smooth muscle, pericytes, neurons, monocytes, CD4 T cells, CD8 T cells, NK cells, B cells, macrophages, endothelial cells, dendritic cells, neutrophils, and eosinophils. 
+```{r echo = FALSE}
+# 1. Load the reference dataset
+
+ref.data.bpe <- BlueprintEncodeData(ensembl=FALSE) # Params indicate to use gene symbols (when set to FALSE instead of 19859 TSPAN6 we have ENSG00000000003 and only 6)
+print(ref.data.bpe)
+# Keep only selected main labels
+keep <- ref.data.bpe$label.main %in% c("Epithelial cells","Fibroblasts",
+                                       "Smooth muscle", "Pericytes","Neurons",
+                                       "Monocytes", "CD4+ T-cells","CD8+ T-cells",
+                                       "B-cells", "NK cells", "Macrophages",
+                                       "Endothelial cells", "Neutrophils",
+                                       "Eosinophils", "DC")
+ref.sub <- ref.data.bpe[, keep]
+print(unique(ref.sub$label.main))
+# 2. Extract expression data (normalized data is usually in the "data" slot)
+test_data <- GetAssayData(pvp, assay = "Xenium", layer = "data")
+head(test_data)
+```
+
+Here, we run **SingleR** using Level2 (high-resolution) annotations and with argument aggr.ref=TRUE, such that reference profiles will be aggregated (per cluster) prior to annotation. In this way, every Xenium cell will be assigned a label based on which pseudo-bulk scRNA-seq profile represents the best match.
+
+```{r}
+# set parallelization
+bp <- MulticoreParam(4)
+
+# perform label transfer at the single cell-level,
+# using pseudo-bulk Chromium profiles as reference
+res <- SingleR(
+    test=test_data, ref=ref.sub, 
+    labels=ref.sub$label.fine, 
+    aggr.ref=TRUE, BPPARAM=bp)
+print(length(unique(ref.sub$label.main)))
+
+# Saving the results in the Seurat object and then saving it locally
+pvp@misc$singleR <- res
+# Saving pvp data
+saveRDS(pvp, file = paste0(path,"/RDS/",fl,".rds"))
+log_msg("RDS file saved.")
+
+tab_labels <- sort(table(pvp@misc$singleR$labels), decreasing = TRUE) 
+tab_labels # We have 43 unique labels inside the 259 fine labels of the reference
+```
+
+```r
+plotScoreHeatmap(res) # Takes too long in my computer
+```
+We identify poor-quality or ambiguous assignments based on the per-cell “delta”, i.e., the difference between the score for the assigned label and the median across all labels for each cell. Our assumption is that most of the labels in the reference are not relevant to any given cell. Thus, the median across all labels can be used as a measure of the baseline correlation, while the gap from the assigned label to this baseline can be used as a measure of the assignment confidence.
+
+Low deltas indicate that the assignment is uncertain, possibly because the cell’s true label does not exist in the reference. An obvious next step is to apply a threshold on the delta to filter out these low-confidence assignments. We use the delta rather than the assignment score as the latter is more sensitive to technical effects. For example, changes in library size affect the technical noise and can increase/decrease all scores for a given cell, while the delta is somewhat more robust as it focuses on the differences between scores within each cell. 
+
+The `pruneScores()` function in the R package SingleR is used to remove low-quality or ambiguous cell type assignments in single-cell RNA-seq data. The example below discards cells with deltas below an arbitrary threshold of 0.2, where higher thresholds correspond to greater assignment certainty.
+
+Cells that had a low confidence score by SingleR were labeled "unassigned" in the DUTRENEO papaer instead of removed.
+```{r}
+pvp$singler_labels <- res$labels
+p1 <- ImageDimPlot(
+  object = pvp,
+  fov = "fov",
+  boundaries = "centroids",
+  group.by = "singler_labels",
+  cols = "polychrome",
+  axes = TRUE
+) 
+ggsave(filename = paste0(path,"/DU53_clusters_FROMrawSingleR.png"), plot = p1, width = 12, height = 12, dpi = 300)
+
+res <- pvp@misc$singleR
+# min.diff.med	= Numeric scalar specifying the minimum acceptable delta for each cell.
+# low_confi <- pruneScores(res, min.diff.med = 0.3)  # N Unassigned = 400237 
+# low_confi <- pruneScores(res, min.diff.med = 0.2) # N Unassigned = 228268
+low_confi <- pruneScores(res, min.diff.med = 0.1)  # N Unassigned = 50775
+res$labels[low_confi] <- "Unassigned"
+tab_labels <- sort(table(res$labels), decreasing = TRUE) 
+tab_labels
+```
+
+According to the DUTRENEO paper, the final list of cell types which we could confidently represent in our Xenium samples are: epithelial cells, endothelial cells, fibroblasts, smooth muscle, neurons, granulocytes, monocytes, CD4 T cells, Tregs, CD8 T cells, NK cells, B cells, plasma cells, macrophages, macrophages M1, macrophages M2, and DCs. Cells that had a low confidence score by SingleR were labeled “unassigned”.
+
+```{r}
+# 5. Add predictions to Seurat metadata
+pvp$singler_labels <- res$labels[match(rownames(pvp@meta.data), rownames(res))]
+
+pvp$singler_labels[pvp$singler_labels == "Pericytes"] <- "Smooth muscle"
+pvp$singler_labels[pvp$singler_labels == "mv Endothelial cells"] <- "Endothelial cells"
+pvp$singler_labels[pvp$singler_labels %in% c("CD4+ Tcm", "CD4+ Tem")] <- "CD4+ T-cells"
+pvp$singler_labels[pvp$singler_labels %in% c("CD8+ Tcm", "CD8+ Tem")] <- "CD8+ T-cells"
+pvp$singler_labels[pvp$singler_labels %in% c("Neutrophils", "Eosinophils")] <- "Granulocytes"
+pvp$singler_labels[pvp$singler_labels %in% c("naive B-cells", "Class-switched memory B-cells", "Memory B-cells")] <- "B-cells"
+
+
+table(pvp$singler_labels)[order(names(table(pvp$singler_labels)))]
+```
+
+```{r}
+saveRDS(pvp, file = paste0(path,"/RDS/",fl,".rds"))
+log_msg("RDS file saved.")
+```
+
+```{r}
+# 6. Visualize
+DimPlot(pvp, group.by = "singler_labels", label = TRUE, label.size = 2, # ) +
+#        repel = TRUE # This makes some labels dissappear to make the plot more readable
+) +
+  coord_fixed() +
+  guides(colour = guide_legend(ncol = 2, override.aes = list(size = 4))) +
+  theme(legend.text = element_text(size = 7))
+```
+That separated green cluster at the lower left corner of the plot can be a sign for distingish epithelial tumoral than epithelial non tumorall cells, so let's check from which cluster in comes from:
+
+**Epithelial markers**
+```{r}
+FeaturePlot(pvp, features = c("EPCAM", "KRT7", "KRT18", "KRT19"))
+```
+**Endothelial markers**
+```{r}
+FeaturePlot(pvp, features = c("PECAM1", "VWF", "KDR", "CLDN5"))
+```
+<span style="background-color: yellow">That separated green cluster is clearly epithelial, so maybe we already have the cluster of epithelial tumoral cells. In order to be able to afirm that more analysis is needed still. In the next steps we will first confirm the SingleR results and then proceed with the malignant detection.
+
+We will not try other methods as we must be closest to the paper to actually be able of making comparisons.</span> Look at [1] for why is SingleR the best and which other methods are its competitor.
+
+## Confirming SingleR annotations
+
+`clustree()` function to get at which resolution should the clustering be made when no annotating data is present. We can use its results to see if the labels chosen in SingleR are good (explanation below). (**IMPORTANT: SingleR is designed to handle batch effects between the reference dataset (used for training) and the test dataset (single-cell data being annotated)**)
+```{r}
+
+resolutions <- c(0.1,0.5, 0.8,1,1.5,2,2.5,3,3.5,4,4.5,5)
+for (res in resolutions){
+  DefaultAssay(pvp) <- "sketch"
+  pvp <- FindClusters(object = pvp,cluster.name = paste0("sketchedRES.",res), resolution = res, algorithm = 4)
+}
+# Saving pvp data
+saveRDS(pvp, file = paste0(path,"/RDS/",fl,".rds"))
+log_msg("RDS file saved.")
+```
+
+```{r}
+# Plot the tree
+#DefaultAssay(pvp) <- "sketch" # Clustree don't use the usbset but the metada object so NaNs will afect its process
+# To avoid NaNs problems
+cols <- grep("^sketchedRES\\.", colnames(pvp@meta.data), value = TRUE)
+keep <- complete.cases(pvp@meta.data[, cols, drop = FALSE])
+pvp_clean <- subset(pvp, cells = rownames(pvp@meta.data)[keep])
+
+p <- clustree::clustree(pvp_clean, prefix = "sketchedRES.")
+ggsave(filename = paste0(path,"/Clustree_", fl,".png"), plot = p, width = 12, height = 20)
+p
+```
+The cluster trees must be understood like the connexion between whole clusters of diferent resolutions and how each data point passes from one cluster to the other:
+- Higher resolution → more clusters
+- Each row = one resolution
+- Each circle = one cluster
+- Arrows = how cells move between clusters when resolution increases
+- The color of the edge = number of cells transferred
+- If the arrows are:
+  - purple → few cells
+  - yellow → many cells
+
+So, why is this usefull for our cell clustering ? Well that's because if the cluster persists across resolutions it means it is biologically meaningful. When the arrows go straight from the parent node and stays teh same or divides into 2 it means its being more precise about one cell type, maybe differentiating the function they are perfoming at that moment. 
+
+If those exact same arrows have a soft color that mean that the percentage of cells that when to one cluster to another is very minimal that given how complex is biology it makes sense but just while the amount of cells is small. Once the arrows have stronger colors they menaing is not biologically meaning full but more caotic ore overclustered.
+
+Let's look at the gene expression of each cluster to be able extract more conclusions about the goodness of these clusters. 
+
+The following code was extracted from [this paper](https://pmc.ncbi.nlm.nih.gov/articles/PMC6057528)
+```{r seurat-genes, fig.cap = "Clustering trees of the PBMC dataset coloured according to the expression of known markers. The node colours indicate the average of the log~2~ gene counts of samples in each cluster. CD19 (A) identifies B cells, CD14 (B) shows a population of monocytes, CD3D (C) is a marker of T cells and CCR7 (D) shows the split between memory and naive CD4 T cells."}
+
+plots <- lapply(c("CD19", "CD14", "CD3D", "CCR7"), function(x) {
+    clustree(pvp_clean, node_colour = x, node_colour_aggr = "mean",
+             node_size_range = c(3, 10), node_text_size = 2,
+             edge_width = 1.2, prefix = "sketchedRES.") +
+    scale_colour_viridis(option = "plasma", begin = 0.3) +
+    guides(size = FALSE,
+           colour = guide_colourbar(title = x,
+                                    barwidth = unit(3, "mm"),
+                                    barheight = unit(35, "mm"),
+                                    order = 1),
+           edge_colour = FALSE,
+           edge_alpha = FALSE) +
+    theme(legend.title = element_text(size = 11),
+          legend.text = element_text(size = 9))
+})
+
+legend <- get_legend(plots[[1]] +
+                         guides(size = guide_legend(title = "Cluster size",
+                                                    title.position = "top",
+                                                    title.hjust = 0.5,
+                                                    label.position = "top",
+                                                    label.hjust = 0.5,
+                                                    order = 1),
+                                colour = FALSE,
+                                edge_colour = guide_edge_colourbar(
+                                    title = "Sample count",
+                                    title.position = "top",
+                                    title.hjust = 0.5,
+                                    barwidth = 12,
+                                    draw.ulim = TRUE,
+                                    draw.llim = TRUE,
+                                    order = 3),
+                                edge_alpha = guide_legend(
+                                    title = "In-proportion",
+                                    title.position = "top",
+                                    title.hjust = 0.5,
+                                    label.position = "top",
+                                    label.hjust = 0.5,
+                                    keywidth = 4,
+                                    order = 4)) +
+                         theme(legend.position = "bottom"))
+panel <- plot_grid(plotlist = plots,
+                   labels = c("A - CD19", "B - CD14", "C - CD3D", "D - CCR7"),
+                   label_size = 20, ncol =2)
+
+ggsave(filename = paste0(path,"/clustree_seurat_genes.png"), 
+       plot = panel, width = 16, height = 12, dpi = 300)
+
+include_graphics(paste0(path,"/clustree_seurat_genes.png"))
+```
+
+It seems like the best precision is 4, 5 and 6. At these levels, most clusters are derived directly from their parent nodes, which results in very few diagonal edges in the clustree plot. Additionally, none of these edges are strongly colored, indicating that only a small percentage of cells change cluster assignments drastically between these resolutions. We will select the fifth one as it is the middle of the accepted ones, which corresponds to the one with .
+
+
+Another way of checking the SingleR results is to plot the labels in the tissue itself. Here finally the biological complexity will help us out as the labels MUST present some kind of structure in other to confirm that they are correct and biologically meaningful.
+```r
+# This code was executed on the cluster as it was too computationally expensive for my computer
+p1 <- ImageDimPlot(
+  object = pvp,
+  fov = "fov",
+  boundaries = "centroids",
+  group.by = "singler_labels",
+  cols = "polychrome",
+  axes = TRUE
+) 
+ggsave(filename = paste0(path,"/DU53_clusters.png"), plot = p1, width = 12, height = 12, dpi = 300)
+```
+
+```{r, out.width="70%"}
+knitr::include_graphics(paste0(path,"/DU53_clusters.png"))
+``` 
+Looking at the overall image we can clearly see some structure, with cluster cells having limits made out of other cell types. The mix of cells types in the surrounding clusters is normal and part of the biological complexity of tissues. Another good indicator is that the big soft red (pinkish) cluster is made out of epithelial cells !!! Which is the most common type of cell in bladder cancer !!!
+
+Another important thing to mention is that unassigned cells (bright green) seem to mostly group themselves arround the epithelial and B-cells clusters.
+
+
+<span style="background-color: yellow">The ovelarp between the choosen cluster and the SingleR results is a very good indicator that the choosen labels are correct. The idea would be to plot the SingleR labels in the chosen cluster's UMAP and see the distribution of each label.</span>
+
+Plot the distribution as a bar plot:
+```{r}
+df <- pvp@meta.data %>%
+  dplyr::count(sketchedRES.1.5, singler_labels) %>%
+  group_by(sketchedRES.1.5) %>%
+  mutate(freq = n / sum(n)) %>%
+  arrange(sketchedRES.1.5, desc(freq)) %>%
+  mutate(ymax = cumsum(freq),
+         ymin = ymax - freq)
+
+# determine dominant celltype per cluster
+cluster_order <- df %>%
+  slice_max(freq, n = 1, with_ties = FALSE) %>%
+  arrange(singler_labels, desc(n)) %>%
+  pull(sketchedRES.1.5)
+
+df$sketchedRES.1.5 <- factor(df$sketchedRES.1.5, levels = cluster_order)
+
+barplot <- ggplot(df) +
+  geom_rect(aes(
+    xmin = as.numeric(sketchedRES.1.5) - 0.45,
+    xmax = as.numeric(sketchedRES.1.5) + 0.45,
+    ymin = ymin,
+    ymax = ymax,
+    fill = singler_labels
+  )) +
+  scale_x_continuous(
+    breaks = sort(unique(as.numeric(df$sketchedRES.1.5))),
+    labels = sort(unique(df$sketchedRES.1.5))
+  ) +
+  ylab("Relative abundance") +
+  xlab("Cluster") +
+  theme_classic()
+umap_1 <- DimPlot(pvp, group.by = "sketchedRES.1.5", label = TRUE)
+umap_2 <- DimPlot(pvp, group.by = "singler_labels", label = TRUE)
+
+ggsave(filename = paste0(path,"/Leiden_SingleR_together.png"),
+       wrap_plots(umap_1, umap_2, barplot),
+       width = 24,
+       height = 6)
+
+```
+
+```{r, out.width="70%"}
+knitr::include_graphics("Annotations/DU53/Leiden_SingleR_together.png")
+``` 
+
+From this clustering we can conclude that the epithelial cells are well defined in two separated clusters (maybe one tumoral and the other healthy epithelial cells, we will find out later). Also a big percentage of the clusters have a main label that can be assigned to with confidence. However, there are still some clusters that do not have a main dominant label but they were rather clustered together by other thing that were NOT cell type. So these clusters are good but they still need some help to identify all the remaining cell types.
+
+Now, we will extract the clusters we consider to have a secure label (relative abundance above thershold per majority class in the cluster).
+```{r}
+# count cells per leiden cluster x singler label
+df <- pvp@meta.data %>%
+  dplyr::count(sketchedRES.1.5, singler_labels, name = "n") %>%
+  group_by(sketchedRES.1.5) %>%
+  mutate(freq = n / sum(n)) %>%
+  ungroup()
+
+# dominant label per cluster
+dominant_clusters <- df %>%
+  group_by(sketchedRES.1.5) %>%
+  slice_max(freq, n = 2, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(desc(freq))
+
+print(dominant_clusters)
+
+# Sketching out the clusters we now for sure have a label
+threshold <- 0.75   # 75%
+
+# Above 0.75% for one label or for one label + unassigned label
+unconcrete_clusters <- dominant_clusters %>%
+  group_by(sketchedRES.1.5) %>%
+  # Filter OUT clusters that meet your "confident" criteria
+  dplyr::filter(!any(
+    # Condition 1: Single label > 75%
+    freq > threshold | 
+    # Condition 2: Top label + Unassigned > 75%
+    (sum(freq[singler_labels %in% c(singler_labels[1], "Unassigned")]) > threshold)
+  )) %>%
+  pull(sketchedRES.1.5) %>%
+  as.character() %>%
+  unique() %>%
+  stats::na.omit()
+print(unconcrete_clusters)
+
+# make sure the active identities are the clustering you want to use
+Idents(pvp) <- "sketchedRES.1.5"
+
+# keep only the unconcrete clusters
+pvp_unconcrete <- subset(pvp, idents = unconcrete_clusters)
+
+pvp_unconcrete
+```
+
+UMAP and SingleR proportions with the new subset. Did the umap changed a lot ?
+```{r}
+df <- pvp_unconcrete@meta.data %>% dplyr::count(sketchedRES.1.5, singler_labels) %>% group_by(sketchedRES.1.5) %>% mutate(freq = n / sum(n)) %>% arrange(sketchedRES.1.5, desc(freq)) %>% mutate(ymax = cumsum(freq), ymin = ymax - freq) 
+# determine dominant celltype per cluster 
+cluster_order <- df %>% slice_max(freq, n = 1, with_ties = FALSE) %>% arrange(singler_labels, desc(n)) %>% pull(sketchedRES.1.5) 
+df$sketchedRES.1.5 <- factor(df$sketchedRES.1.5, levels = cluster_order)
+
+barplot <- ggplot(df) +
+  geom_rect(aes(
+    xmin = as.numeric(sketchedRES.1.5) - 0.45,
+    xmax = as.numeric(sketchedRES.1.5) + 0.45,
+    ymin = ymin,
+    ymax = ymax,
+    fill = singler_labels
+  )) +
+  scale_x_continuous(
+    breaks = sort(unique(as.numeric(df$sketchedRES.1.5))),
+    labels = sort(unique(df$sketchedRES.1.5))
+  ) +
+  ylab("Relative abundance") +
+  xlab("Cluster") +
+  theme_classic()
+umap_1 <- DimPlot(pvp_unconcrete, group.by = "sketchedRES.1.5", label = TRUE)
+
+
+ggsave(filename = paste0(path,"/Leiden_SingleR_Reduced.png"),
+       wrap_plots(barplot, umap_1, widths = 12),
+       width = 24,
+       height = 6)
+```
+Logically the cocnrete clusters where the most separated in the UMAP, meaning the center of the UMAp is still packed.
+
+The labels have to extract the top 3 markers from [2], which are general markers for each cell type, are: 
+B-cells: CD79A, MS4A1, CD19
+CD4+ T-cells (Memory CD4+ cytotoxic T cells): GZMK, CD4, IL10
+CD8+ T-cells (CD8a/a & CD8a/b(entry)): ZNF683, GNG4, PDCP1, TOX2, SATB1, CCR9
+DC: CD1C, FCER1A, CLEC10A
+Endothelial cells: CLDN5, PLVAP, SPARCL1
+Epithelial cells: KRT15,KRT17, CCL19
+Fibroblasts: COL1A1, COL1A2, DCN
+Granulocytes: KIT, CPA3, SLC45A3
+Macrophages: C1QA , CD68, TREM2
+Macrophages M1: 
+Macrophages M2:
+Monocytes: S100A9, LYZ, FCN1
+Neurons:
+NK cells: GNLY, XCL2 , NKG7
+Smooth muscle : 
+Plasma cells: JCHAIN, MZB1, XBP1
+Tregs: CD27, CCR7, IKZF4
+Tumo MCBI:
+
+
+```{r}
+top5_v2 <- pvp_unconcrete@misc$markers %>% 
+  group_by(cluster) %>% 
+  dplyr::filter(abs(avg_log2FC) > 1) %>% 
+  slice_max(order_by = abs(avg_log2FC), n = 5, with_ties = FALSE) %>% 
+  ungroup()
+
+genes_v2 <- unique(top5_v2$gene)
+
+p <- DotPlot(object = pvp_unconcrete, features = genes_v2, group.by = "singler_labels") + 
+  RotatedAxis() + 
+  theme(
+    axis.text.x = element_text(size = 8, angle = 90, hjust = 1),
+    axis.text.y = element_text(size = 12)
+)
+
+ggsave(filename = paste0(path,"/dotplot_SingelR.png"), plot = p, width = 30, height = 12, dpi = 300)
+
+```
+
+```{r, out.width="70%"}
+knitr::include_graphics("Annotations/DU53/dotplot_SingelR.png")
+``` 
+
+The problem with the previous Dotplot is that is not very explanatory as we are mixing the top 5 genes per cluster in the leiden cluster with the top label assigned in that cluster by SingleR. So we were mixing things up. In order to get the most out of it we can make another DotPlot that uses the **canonical genes specific for each SingleR label and another one with the cluster per leiden** and see their matches.
+```{r}
+
+genes_v2_list <- list(
+  "B-cells" = c("CD79A","MS4A1","CD19"),
+  "CD4+ T-cells" = c("GZMK","CD4","IL10"),
+  "CD8+ T-cells" = c("ZNF683","GNG4","PDCP1","TOX2","SATB1","CCR9"),
+  "DC" = c("CD1C","FCER1A","CLEC10A"),
+  "Endothelial cells" = c("PECAM1","VWF"), # Genes used before, as the ones in the webpage were not in our data
+  "Epithelial cells" = c("EPCAM","KRT7","CCL19"), # Mix of genes used before and webpage
+  "Fibroblasts" = c("PDGFRA", "PDGFRB", "CD34", "TCF4"), # Google canonical genes tahta were in our data 
+  "Granulocytes" = c("KIT","CPA3","SLC45A3"),
+  "Macrophages" = c("C1QA","CD68","TREM2"),
+  "Monocytes" = c("S100A9","LYZ","FCN1"),
+  "NK cells" = c("GNLY","XCL2","NKG7"),
+  "Plasma cells" = c("JCHAIN","MZB1","XBP1"),
+  "Tregs" = c("CD27","CCR7","IKZF4")
+)
+
+genes_v2 <- unlist(genes_v2_list)
+
+p1 <- DotPlot(pvp_unconcrete, features = genes_v2, group.by = "singler_labels") +
+  RotatedAxis() +
+  theme_bw() +
+  theme(
+    axis.text.x = ggtext::element_markdown(size = 8, angle = 90, hjust = 1),
+    axis.text.y = element_text(size = 11, face = "bold"),
+    panel.grid = element_blank()
+  )
+p2 <- DotPlot(pvp_unconcrete, features = genes_v2, group.by = "sketchedRES.1.5") +
+  RotatedAxis() +
+  theme_bw() +
+  theme(
+    axis.text.x = ggtext::element_markdown(size = 8, angle = 90, hjust = 1),
+    axis.text.y = element_text(size = 11, face = "bold"),
+    panel.grid = element_blank()
+  )
+ggsave(filename = paste0(path,"/Leiden_SingelR_CanonicalGenes.png"), plot = wrap_plots(p1, p2), width = 35, height = 12, dpi = 300)
+```
+
+```{r, out.width="70%"}
+knitr::include_graphics("Annotations/DU53/Leiden_SingelR_CanonicalGenes.png")
+```
+
+Cluster 4 is clearly B-cells
+Cluster 9 follows the same pattern as plasma cells in barplot is mostly plasma with unnasigned and then Tregs which are very similar to plasma cells and might have been a misclasification due to how similar they are ??? MARC ??
+Cluster 2 seems to be CD8+ T-cells
+
+But this process requires too much human on the loop and we must do this for all the samples we have, so let's automate it !
+`AggregateExpression()` simply sums all the counts of that gene in the space, in biology it is better to use the average as agrupations of genes in the sample might bias the calculations (lot's of genes because it is highly expressed in one section not because there are lot's of that cell type in the cluster). Let's try it with `AverageExpression` or `AddModuleScore`
+```{r}
+
+# 1. Get average expression for your specific marker genes
+# We use the 'RNA' assay (or 'SCT') and the specific gene list you defined
+avg_singler <- AverageExpression(pvp_unconcrete, 
+                                 group.by = "singler_labels", 
+                                 features = genes_v2)$SCT
+
+avg_leiden <- AverageExpression(pvp_unconcrete, # Average o AddModule Score
+                                group.by = "sketchedRES.1.5", 
+                                features = genes_v2)$SCT
+
+# 2. Calculate Spearman correlation between the two matrices
+cor_matrix <- cor(as.matrix(avg_leiden), as.matrix(avg_singler), method = "spearman")
+
+# 3. Visualize
+pheatmap(cor_matrix, 
+         main = "Correlation: Leiden Clusters vs SingleR Labels",
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         display_numbers = TRUE, # Shows the correlation value in the box
+         angle_col = 45)
+```
+CLUSTER 11 TIENE LIO Q FLIPAS, Habria que pillar genes mas espcificos para las celulas que faltan --< Hecho y funciona bien pero...
+CLUSTER 26 da 90% para algo que es lio si usamos AverageExpression, si usamos Aggregate da 89, no hay mucha diferencia. Tiene más sentido biologico el Average así que dejaremos ese porque no hya mucha diferencia en los resultados.
+
+
+Webpage's markers in the featureplot:
+```{r}
+FeaturePlot(pvp, features = genes_v2_list$`B-cells`)
+```
+
+IDEAS:
+
+Next step should be finding more genes for the heatmap to be more concrete ? Already done, results still insuficient
+
+We could exclude the cell with confirmed labels and remake the clustering to separate the clusters again and see if the different cell types are more separated. --> No paper does that, they use markers.
+
+Podriamos usar marker_table_summary donde tenemos top markers por cluster hecho con leiden. Q podriamos hacer ? Aún así nos convendria ver que hace la gente --> No podemos usar unos genes cualquiera como marcadores tienen que ser especificos para nuestro tejido !! Mentira podemos seguir usando unos muy muy generales --> It helped us find specific markers and then extract specific cell from unconcrete clsuters.
+
+CONCLUSION:
+
+Marc, my supervisor, already tried using different algorithms but there was no better outcome. So instead of using other algorithms let's try using a **reduced cell type list** can help *SingelR* to achieve better results.
+
+
+## Small break to check if fewer labels improve the annotation process
+Changes we are going to make in the annotation list are:
+- We are going to group CD4, CD8 and Tregs under B-cells.
+- Macrophages M1 and M2 grouped under Macrophages
+- Neurons label is going to be removed
+- Plasma cells has the posisbility of being grouped under B-cells in the future but let's leave just for now.
+
+```{r}
+ref.data.bpe <- BlueprintEncodeData(ensembl=FALSE) 
+print(ref.data.bpe)
+# Keep only selected main labels
+keep <- ref.data.bpe$label.main %in% c("Epithelial cells","Fibroblasts",
+                                       "Smooth muscle", "Pericytes",
+                                       "Monocytes", "CD4+ T-cells","CD8+ T-cells",
+                                       "B-cells", "NK cells", "Macrophages",
+                                       "Endothelial cells", "Neutrophils",
+                                       "Eosinophils", "DC")
+ref.sub <- ref.data.bpe[, keep]
+print(unique(ref.sub$label.main))
+# Extract expression data (normalized data is usually in the "data" slot)
+test_data <- GetAssayData(pvp, assay = "Xenium", layer = "data")
+head(test_data)
+```
+
+```{r} 
+ref.sub$label.fine[ref.sub$label.fine == "Pericytes"] <- "Smooth muscle"
+ref.sub$label.fine[ref.sub$label.fine == "mv Endothelial cells"] <- "Endothelial cells"
+ref.sub$label.fine[ref.sub$label.fine %in% c("CD4+ Tcm", "CD4+ Tem", "CD8+ Tcm", "CD8+ Tem", "Tregs", "CD4+ T-cells", "CD8+ T-cells")] <- "T-cells"
+ref.sub$label.fine[ref.sub$label.fine %in% c("Neutrophils", "Eosinophils")] <- "Granulocytes"
+ref.sub$label.fine[ref.sub$label.fine %in% c("Macrophages M1", "Macrophages M2")] <- "Macrophages"
+ref.sub$label.fine[ref.sub$label.fine %in% c("naive B-cells", "Class-switched memory B-cells", "Memory B-cells")] <- "B-cells"
+
+print(unique(ref.sub$label.fine))
+```
+Now this is the reduced list we want to work with to see if the algorithm can work better !
+```{r}
+# set parallelization
+bp <- MulticoreParam(4)
+
+res <- SingleR(
+    test=test_data, ref=ref.sub, 
+    labels=ref.sub$label.fine, 
+    aggr.ref=TRUE, BPPARAM=bp)
+print(length(unique(ref.sub$label.main)))
+
+tab_labels <- sort(table(res$labels), decreasing = TRUE) 
+tab_labels
+```
+
+```{r}
+pvp$singler_labels <- res$labels
+p1 <- ImageDimPlot(
+  object = pvp,
+  fov = "fov",
+  boundaries = "centroids",
+  group.by = "singler_labels",
+  cols = "polychrome",
+  axes = TRUE
+) 
+ggsave(filename = paste0(path,"/DU53_clusters_FROMrawSingleR.png"), plot = p1, width = 12, height = 12, dpi = 300)
+
+low_confi <- pruneScores(res, min.diff.med = 0.1)  
+res$labels[low_confi] <- "Unassigned"
+tab_labels <- sort(table(res$labels), decreasing = TRUE) 
+tab_labels
+
+pvp$singler_labels <- res$labels[match(rownames(pvp@meta.data), rownames(res))]
+
+p1 <- ImageDimPlot(
+     object = pvp,
+     fov = "fov",
+     boundaries = "centroids",
+     group.by = "singler_labels",
+     cols = "polychrome",
+     axes = TRUE
+) 
+ggsave(filename = paste0(path,"/AfterPruneScore.png"), plot = p1, width = 12, height = 12, dpi = 300)
+```
+
+```{r}
+pvp$singler_labels <- res$labels[match(rownames(pvp@meta.data), rownames(res))]
+saveRDS(pvp, file = paste0(path,"/RDS/",fl,".rds"))
+log_msg("RDS file saved.")
+
+table(pvp$singler_labels)[order(names(table(pvp$singler_labels)))]
+```
+
+```{r}
+# Visualize
+DimPlot(pvp, group.by = "singler_labels", label = TRUE, label.size = 2,) +
+  coord_fixed() +
+  guides(colour = guide_legend(ncol = 2, override.aes = list(size = 4))) +
+  theme(legend.text = element_text(size = 7))
+```
+
+```{r}
+# Clustree
+resolutions <- c(0.1,0.5, 0.8,1,1.5,2,2.5,3,3.5,4,4.5,5)
+for (res in resolutions){
+  DefaultAssay(pvp) <- "sketch"
+  pvp <- FindClusters(object = pvp,cluster.name = paste0("ReducedRES.",res), resolution = res, algorithm = 4)
+}
+
+cols <- grep("^sketchedRES\\.", colnames(pvp@meta.data), value = TRUE)
+keep <- complete.cases(pvp@meta.data[, cols, drop = FALSE])
+pvp_clean <- subset(pvp, cells = rownames(pvp@meta.data)[keep])
+
+p <- clustree::clustree(pvp_clean, prefix = "sketchedRES.")
+ggsave(filename = paste0(path,"/Reduced_Clustree_", fl,".png"), plot = p, width = 12, height = 20)
+p
+```
+
+For the reduced clustree we can choose that the most appropiate clustering resolution is 1, which corresponds to the fourth line of the clustree plot. We executed the previous chunk without saving the results to save space so now we must reexecute only one with the choosen resolution.
+
+```{r}
+DefaultAssay(pvp) <- "sketch"
+pvp <- FindClusters(object = pvp,cluster.name = paste0("ReducedRES.",1), resolution = 1, algorithm = 4)
+
+saveRDS(pvp, file = paste0(path,"/RDS/",fl,".rds"))
+log_msg("RDS file saved.")
+```
+
+```{r}
+df <- pvp@meta.data %>%
+  dplyr::count(ReducedRES.1, singler_labels) %>%
+  group_by(ReducedRES.1) %>%
+  mutate(freq = n / sum(n)) %>%
+  arrange(ReducedRES.1, desc(freq)) %>%
+  mutate(ymax = cumsum(freq),
+         ymin = ymax - freq)
+
+# determine dominant celltype per cluster
+cluster_order <- df %>%
+  slice_max(freq, n = 1, with_ties = FALSE) %>%
+  arrange(singler_labels, desc(n)) %>%
+  pull(ReducedRES.1)
+
+df$ReducedRES.1 <- factor(df$ReducedRES.1, levels = cluster_order)
+
+barplot <- ggplot(df) +
+  geom_rect(aes(
+    xmin = as.numeric(ReducedRES.1) - 0.45,
+    xmax = as.numeric(ReducedRES.1) + 0.45,
+    ymin = ymin,
+    ymax = ymax,
+    fill = singler_labels
+  )) +
+  scale_x_continuous(
+    breaks = sort(unique(as.numeric(df$ReducedRES.1))),
+    labels = sort(unique(df$ReducedRES.1))
+  ) +
+  ylab("Relative abundance") +
+  xlab("Cluster") +
+  theme_classic()
+umap_1 <- DimPlot(pvp, group.by = "ReducedRES.1", label = TRUE)
+umap_2 <- DimPlot(pvp, group.by = "singler_labels", label = TRUE)
+
+ggsave(filename = paste0(path,"/Leiden_SingleR_together.png"),
+       wrap_plots(umap_1, umap_2, barplot),
+       width = 24,
+       height = 6)
+```
+
+
+```{r}
+# count cells per cluster x SingleR label
+df <- pvp@meta.data %>%
+  dplyr::count(ReducedRES.1, singler_labels, name = "n") %>%
+  group_by(ReducedRES.1) %>%
+  mutate(freq = n / sum(n)) %>%
+  ungroup()
+
+# top labels per cluster
+dominant_clusters <- df %>%
+  group_by(ReducedRES.1) %>%
+  slice_max(freq, n = 2, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(ReducedRES.1, desc(freq))
+
+threshold <- 0.75
+
+# initialize final labels in original object
+pvp$Final_Labels <- "Unconcrete"
+
+# clusters confidently labeled by SingleR
+# Above 0.75% for one label or for one label + unassigned label
+concrete_clusters <- dominant_clusters %>%
+  group_by(ReducedRES.1) %>%
+  dplyr::filter(
+    # Condition 1: Single label > 75%
+    any(freq > threshold) |
+    # Condition 2: Top label + Unassigned > 75%
+    any(sum(freq[singler_labels %in% c(singler_labels[1], "Unassigned")]) > threshold)
+  ) %>%
+  ungroup() 
+
+# assign the top non-Unassigned label to those confident clusters
+cluster_labels <- concrete_clusters %>%
+  #dplyr::filter(singler_labels != "Unassigned") %>%
+  group_by(ReducedRES.1) %>%
+  slice_max(freq, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  dplyr::select(ReducedRES.1, assigned_label = singler_labels)
+
+for(i in seq_len(nrow(cluster_labels))) {
+  cl <- cluster_labels$ReducedRES.1[i]
+  lab <- cluster_labels$assigned_label[i]
+  cells_use <- rownames(pvp@meta.data)[pvp$ReducedRES.1 == cl]
+  pvp$Final_Labels[cells_use] <- lab
+}
+
+table(pvp$Final_Labels[pvp$ReducedRES.1 == "2"])
+
+# subset only ambiguous clusters
+Idents(pvp) <- "ReducedRES.1"
+
+unconcrete_clusters <- setdiff(
+  unique(as.character(pvp$ReducedRES.1)),
+  unique(as.character(cluster_labels$ReducedRES.1))
+)
+
+unconcrete_clusters <- unconcrete_clusters[!is.na(unconcrete_clusters)]
+
+pvp_unconcrete <- subset(pvp, idents = unconcrete_clusters)
+pvp_unconcrete
+```
+
+```{r}
+df <- pvp_unconcrete@meta.data %>% dplyr::count(ReducedRES.1, singler_labels) %>% group_by(ReducedRES.1) %>% mutate(freq = n / sum(n)) %>% arrange(ReducedRES.1, desc(freq)) %>% mutate(ymax = cumsum(freq), ymin = ymax - freq) 
+# determine dominant celltype per cluster 
+cluster_order <- df %>% slice_max(freq, n = 1, with_ties = FALSE) %>% arrange(singler_labels, desc(n)) %>% pull(ReducedRES.1) 
+df$ReducedRES.1 <- factor(df$ReducedRES.1, levels = cluster_order)
+
+barplot <- ggplot(df) +
+  geom_rect(aes(
+    xmin = as.numeric(ReducedRES.1) - 0.45,
+    xmax = as.numeric(ReducedRES.1) + 0.45,
+    ymin = ymin,
+    ymax = ymax,
+    fill = singler_labels
+  )) +
+  scale_x_continuous(
+    breaks = sort(unique(as.numeric(df$ReducedRES.1))),
+    labels = sort(unique(df$ReducedRES.1))
+  ) +
+  ylab("Relative abundance") +
+  xlab("Cluster") +
+  theme_classic()
+umap_1 <- DimPlot(pvp_unconcrete, group.by = "ReducedRES.1", label = TRUE)
+
+
+ggsave(filename = paste0(path,"/Leiden_SingleR_Reduced.png"),
+       wrap_plots(barplot, umap_1, widths = 12),
+       width = 24,
+       height = 6)
+```
+
+```{r}
+pvp_unconcrete@misc$markers <- FindAllMarkers(pvp_unconcrete, only.pos = TRUE)
+
+top5_v2 <- pvp_unconcrete@misc$markers %>% 
+  group_by(cluster) %>% 
+  dplyr::filter(abs(avg_log2FC) > 1) %>% 
+  slice_max(order_by = abs(avg_log2FC), n = 5, with_ties = FALSE) %>% 
+  ungroup()
+
+genes_v2 <- unique(top5_v2$gene)
+
+p <- DotPlot(object = pvp_unconcrete, features = genes_v2, group.by = "singler_labels") + 
+  RotatedAxis() + 
+  theme(
+    axis.text.x = element_text(size = 8, angle = 90, hjust = 1),
+    axis.text.y = element_text(size = 12)
+)
+
+ggsave(filename = paste0(path,"/dotplot_SingelR.png"), plot = p, width = 30, height = 12, dpi = 300)
+
+```
+
+```{r}
+
+genes_v2_list <- list(
+  "B-cells" = c("CD79A","MS4A1","CD19"),
+  "CD4+ T-cells" = c("GZMK","CD4"),
+  "CD8+ T-cells" = c("ZNF683","GNG4","PDCP1","TOX2","SATB1","CCR9"),
+  "DC" = c("CD1C","FCER1A","CLEC10A"),
+  "Endothelial cells" = c("PECAM1","VWF"), # Genes used before, as the ones in the webpage were not in our data
+  "Epithelial cells" = c("EPCAM","KRT7","CCL19"), # Mix of genes used before and webpage
+  "Fibroblasts" = c("PDGFRA", "PDGFRB", "CD34", "TCF4"), # Google canonical genes tahta were in our data 
+  "Granulocytes" = c("KIT","CPA3","SLC45A3"),
+  "Macrophages" = c("C1QA","CD68","TREM2"),
+  "Monocytes" = c("S100A9","LYZ","FCN1"),
+  "NK cells" = c("GNLY","XCL2","NKG7"),
+  "Plasma cells" = c("JCHAIN","MZB1","XBP1"),
+  "Tregs" = c("CD27","CCR7","IKZF4")
+)
+
+genes_v2 <- unlist(genes_v2_list)
+
+p1 <- DotPlot(pvp_unconcrete, features = genes_v2, group.by = "singler_labels") +
+  RotatedAxis() +
+  theme_bw() +
+  theme(
+    axis.text.x = ggtext::element_markdown(size = 8, angle = 90, hjust = 1),
+    axis.text.y = element_text(size = 11, face = "bold"),
+    panel.grid = element_blank()
+  )
+p2 <- DotPlot(pvp_unconcrete, features = genes_v2, group.by = "ReducedRES.1") +
+  RotatedAxis() +
+  theme_bw() +
+  theme(
+    axis.text.x = ggtext::element_markdown(size = 8, angle = 90, hjust = 1),
+    axis.text.y = element_text(size = 11, face = "bold"),
+    panel.grid = element_blank()
+  )
+ggsave(filename = paste0(path,"/Leiden_SingelR_CanonicalGenes.png"), plot = wrap_plots(p1, p2), width = 35, height = 12, dpi = 300)
+```
+
+<span style="background-color: yellow">The reduction of the labels improved the results by reducing the clusters but still the remaining clusters are too mix to give them all a single label. Also, the less clear labels are the ones with less cells in this tissue, so they could be negiglible after the refinement. So we are going to annotate them based on the cell markers.</span>
+
+## Continue with the refinement with the markers
+
+The `DotPlot()` genes per each cell type show that epithelial cells have very unique gene sigsnatures compared to the other cell type in the SingleR annotations. So first, we can assign with confidence the Epithelial label to the cell that SingleR considered Epithelial. 
+
+
+Here we will take profit of `AddModuleScore()` function and the FindAllmarkers result. The first one can help us compare the log2 fold cahnge between two cell types that are very similar and the second one helps us when they are 3. So, how should it be understood ?
+<span style="background-color: yellow">
+`AddModuleScore` calculates the average expression levels of each program (cluster) on single cell level, subtracted by the aggregated expression of control gene sets (background). All analyzed genes are binned based on averaged expression, and the control genes are randomly selected from each bin.
+So, when we do res = log2(T-cells/NK cells), being T-cells and NK cells the results for each from `AddModuleScore`, we can have 3 situations:
+- res >= 1 ==> implies that T-cells
+- res < 0 ==> implies that NK
+- -1 < res < 1 ==> Unnassigned
+
+In contrast, using this ratio with `AddModuleScore` is problematic because:
+- Scores can be negative, making the ratio undefined or meaningless
+- Scores can be zero, leading to division errors or infinite values
+- The scores are already background-corrected differences, so applying a ratio distorts their interpretation
+
+Therefore, while `AddModuleScore` is useful for detecting expression above background, `AddModuleScore_UCell` is better suited for direct comparison between gene programs using ratios, as in our case. Its rank-based, positive, and bounded scores provide a more stable and interpretable framework for distinguishing between T-cell and NK-cell signatures.
+</span>
+
+```{r}
+# Looking at the amount of unassigns BEFORE to compare the change
+table(pvp$Final_Labels)[order(names(table(pvp$Final_Labels)))]
+print("==================================================================================")
+table(pvp$singler_labels)[order(names(table(pvp$singler_labels)))]
+```
+`AddModuleScore` computes a mean expression for your gene set, a mean for matched control genes, and subtracts them. The NaNs we saw were resulting from missing genes in the BlanckCodeword assay. We could conclude that thanks to the warning messages from `AverageExpression()`: *The following 25 features were not found in the BlankCodeword assay: ...*
+
+```{r}
+DefaultAssay(pvp) <- "SCT"
+
+# Genes extracted from the previous code + CellMarker2.0
+signatures <- list(
+  "B-cells" = c("CD79A","MS4A1","CD19","BANK1"),
+  "CD4+ T-cells" = c("GZMK","CD4","CD3E","FOXP3","IL2RA","CTLA4","CD28"), 
+  "DC" = c("CD1C","FCER1A","CLEC10A","CD83","IL3RA","LILRA4","CD86"),
+  "Endothelial cells" = c("PECAM1","VWF","SELE"), 
+  "Epithelial cells" = c("EPCAM","KRT7","CCL19"), 
+  "Fibroblasts" = c("PDGFRA","PDGFRB","CD34","TCF4","THY1","PDPN"), 
+  "Granulocytes" = c("KIT","CPA3","SELL"),
+  "Macrophages" = c("CD68","TREM2","CD163","MRC1","MARCO"),
+  "Monocytes" = c("FCN1","CD14","CCR2","FCGR3A","LILRB2"),
+  "NK cells" = c("GNLY","NKG7","KLRD1","KLRC1","KLRB1"),
+  "Plasma cells" = c("MZB1","TNFRSF17","SLAMF7")
+)
+
+genes_use_list <- lapply(signatures, function(x) {
+  intersect(unlist(x), rownames(pvp))
+})
+
+pvp <- AddModuleScore(
+  object = pvp,
+  assay="SCT",
+  features = genes_use_list,
+  ctrl = 2,
+  name = "CellType"
+)
+pvp$CellType1 # Esto es lo cada CELL resta la media con la expressión que hay en esa celula de los gens de arriba, no deberia tener Nans !!!
+
+#aux <- AverageExpression(pvp,group.by = "singler_labels", features = unlist(genes_v2_list))$SCT
+#aux
+
+# T-cells and NK cells
+res <- log2(pvp@meta.data$CellType2/pvp@meta.data$CellType10)
+res # Esto nos deberia dar si hay más o menos expression de un tipo celular q del otro por cell, como son las que más se parecen a nivel de marcadores así las podemos diferenciar
+```
+
+Lo primordial: que las labels de arriba no se superpongan a las que ya tenemos aseguradas ! ==> Pillas solo las cellulas que estan en los unconcrete clusters
+
+```{r}
+library(UCell)
+
+pvp <- AddModuleScore_UCell(pvp, features=signatures, 
+                                      w_neg = 1.0, name = NULL)
+
+# Selecting the cells we are unconcrete about their label (we could use pvp_unconcrete above, more optimal)
+cells_use <- WhichCells(pvp, idents = c(1, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 20, 21))
+scores <- pvp[[names(signatures)]][cells_use, ]
+head(scores,15)
+```
+
+```{r}
+# T-cells and NK cells
+eps <- 1e-6 # To handle zeros
+res <- log2((scores$`CD4+ T-cells` + eps) / (scores$`NK cells` + eps))
+
+label <- ifelse(scores$`CD4+ T-cells` > 0.6 & res >= 1, "T-cell",
+         ifelse(scores$`NK cells` > 0.6 & res <= -1, "NK",
+         "Unassigned"))
+```
+
+Here we are handeling with the unconcrete CLUSTERS that have a mix of the SingleR labels. SingleR was based on the gene expression and the clusters could have grouped them by position in the space. Also, considering that the following pairs were grouped due to similar canonical genes, both SingleR and clusters alone are not appropiate groundtruth nor points to support ourselves on.
+
+
+For clusters with unclear identity, we will assign labels based on SingleR and validate them by comparing their gene expression profiles to previously characterized cells with similar expression patterns in the DotPlot. For example, for the cells that have been labeled as T-cells by SingleR, we will compare their expression with NK cell type, as these represent a closely related cell type with similar gene expression profiles.
+
+
+
+
+Porque hay tan pocas cellS_use ????????????????? Porque no estamos accediendo a las cells que tocan, cuales son ? Ni puta idea
+
+
+```{r}
+# Looking at the amount of unassigns BEFORE to compare the change
+table(pvp$singler_labels)[order(names(table(pvp$singler_labels)))]
+```
+
+```{r}
+# Labels of the concrete clusters
+table(pvp$Final_Labels)[order(names(table(pvp$Final_Labels)))]
+```
+
+
+```{r}
+# The labels of the unconcrete clusters
+table(res$label)[order(names(table(res$label)))]
+```
+
+THIS FUNCTION IS NOT QUITE USEFUL AS THE LOG 2 FOLD CHANGE SHOULD BE MADE WITH THE RESULTS FROM FINDALLMARKERS THAT ALREADY GIVES YOU THE LOGARITHM.
+```{r}
+compute_pairwise_scores_singleR <- function(
+  seurat_obj, scores, celltype_1, celltype_2, singleR_col = "singler_labels", eps = 1e-6, update_seurat = FALSE) {
+  
+  # Obtain SingleR labels
+  singleR_labels <- seurat_obj@meta.data[rownames(scores), singleR_col, drop = TRUE]
+  
+  # To keep only cells previously assigned by SingleR to one of the two types
+  cells_keep <- rownames(scores)[singleR_labels %in% c(celltype_1, celltype_2)]
+  
+  if (length(cells_keep) == 0) {
+    stop("No cells found with SingleR labels matching the requested cell types")
+  }
+  if(celltype_1 == "T-cells"){celltype_1= "CD4+ T-cells"}
+  else if(celltype_2 == "T-cells"){celltype_2= "CD4+ T-cells"}
+  
+  m <- as.matrix(scores[cells_keep, c(celltype_1, celltype_2), drop = FALSE])
+  
+  score_1 <- m[, celltype_1]
+  score_2 <- m[, celltype_2]
+  
+  log2ratio <- log2((score_1 + eps) / (score_2 + eps))
+  label <- ifelse(
+    log2ratio >= 1, celltype_1,
+    ifelse(log2ratio <= -1, celltype_2, "Unassigned")
+  )
+  
+  res <- data.frame(
+    SingleR_label = seurat_obj@meta.data[cells_keep, singleR_col, drop = TRUE],
+    score_1 = score_1,
+    score_2 = score_2,
+    log2ratio = log2ratio,
+    label = label,
+    row.names = rownames(m)
+  )
+  cat("\n=== Computed labels ===\n")
+  lab_tab <- table(res$label, useNA = "ifany")
+  print(lab_tab[order(names(lab_tab))])
+  
+  cat("\n=== SingleR labels ===\n")
+  sr_tab <- table(res$SingleR_label, useNA = "ifany")
+  print(sr_tab[order(names(sr_tab))])
+  
+  if (update_seurat){
+     # Cells to update (exclude Unassigned)
+    cells_update <- rownames(res)[res$label != "Unassigned"]
+    
+    cat("\n=== Updating Seurat metadata ===\n")
+    cat("Cells updated:", length(cells_update), "\n")
+    
+    # Perform update safely
+    seurat_obj$Final_Labels[cells_update] <- res[cells_update, "label"]
+    
+    return(list(res = res, seurat_obj = seurat_obj))
+  }
+  
+  else { return(res) }
+}
+```
+
+Where should we put the resulting labels? Final_Labels was created for these specified labels and we do not have to worry about modifying other concreted labels as the scores were selected only for the unconcrete clusters. We could add a variable in the function above to assign the chosen labels to Final_Labels.
+```{r}
+# T-cells and NK cells
+out <- compute_pairwise_scores_singleR(pvp, scores, "T-cells", "NK cells", update_seurat = TRUE)
+pvp <- out$seurat_obj
+res <- out$res
+head(res)
+```
+
+```{r}
+# Plasma and B-cells
+out <- compute_pairwise_scores_singleR(pvp, scores, "Plasma cells", "B-cells", update_seurat = TRUE)
+pvp <- out$seurat_obj
+res <- out$res
+# Endothelial and Granulocytes
+out <- compute_pairwise_scores_singleR(pvp, scores, "Endothelial cells", "Granulocytes", update_seurat = TRUE)
+pvp <- out$seurat_obj
+res <- out$res
+```
+```{r}
+# Labels of the concrete clusters, BEFORE we had 447546 unconcretes
+table(pvp$Final_Labels)[order(names(table(pvp$Final_Labels)))]
+```
+Now we can use `FindAllMarkers` function to the rest of our analysis. IMPORTANT! The code where the concrete_clusters were assigned is necessary to run the following chunks of code.
+
+```{r}
+# 1. Use those labels as identities
+Idents(pvp) <- "singler_labels" # So that the clusters in FindAllMarkers are the cell types
+
+# 2. Use RNA assay for marker finding
+DefaultAssay(pvp) <- "SCT"
+
+markers <- FindAllMarkers(
+  pvp,
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+)
+
+# 3. Top 10 genes per cell type
+# Keep only statistically significant positive markers
+# - p_val_adj < 0.05: significant after multiple-testing correction
+# - abs(avg_log2FC) > 0: gene is more expressed in that cell type than in the others
+markers_sig <- markers %>%
+  dplyr::filter(
+    p_val_adj < 0.05, # p_val corrected for multiple testing (e.g. Bonferroni)
+    abs(avg_log2FC) > 0
+)
+
+# For each cell type, keep the top 10 genes with the highest positive log fold-change
+top10_genesXcellType <- markers_sig %>%
+  group_by(cluster) %>%
+  slice_max(order_by = abs(avg_log2FC), n = 10, with_ties = FALSE) %>%
+  ungroup()
+
+# Inspect result
+top10_genesXcellType
+```
+
+**NK cells:**
+According to PanglaoDB they are more probable to be T-cells first and NK cells second. Most of the genes are assigned to T-cells's pathways but none of them mentions NK cells in Gene Cards.
+
+**Monocytes:**
+According to PanglaoDB they are more probable to be DC and unknow rather than monocytes with really poor confidence.
+
+**Macrophages:** (PERCURSOSR OF MONCYTES)
+According to PanglaoDB, the markers are for DC or T-cells rather than macropahes with really poor confidence. *OJITO CON ESTE T-cells no deberia ser*
+
+**Smooth muscle:**
+According to PanglaoDB, the markers are for germ cells first (130) and smooth muscle second (90). Possible cancer according to google? OKAAAAY
+
+**Granulocytes:**
+According to PanglaoDB, the markers are for DC, Endothelial cells, monocytes, T-cells rather than granulocytes *WHICH NOT EVEN ON THE BARPLOT !!!!*
+
+**Ephitelial cells:**
+According to PanglaoDB, the markers are for Basal cells, Cholangiocytes, unknown, Ductal cells and germ cells rather than Ephitelial cells with really poor confidence (80 in comparison with the first 240).
+
+---------------------------------------------------------------------
+
+**Plasma cells:**
+According to PanglaoDB the markers indicate most probably to be plasma cells confidently, no need to check with Gene Cards.
+
+**B-cells:**
+According to PanglaoDB the markers indicate most probably to be B-cells confidently, no need to check with Gene Cards.
+
+**Endothelial cells:**
+According to PanglaoDB, the markers indicate most probably to be Endothelial cells confidently, no need to check with Gene Cards.
+
+**Fibroblasts:**
+According to PanglaoDB, the markers indicate most probably to be Fibroblasts confidently (although following closely is the label Unkown).
+
+**T-cells:**
+According to PanglaoDB, the markers indicate most probably to be T-cells confidently.
+
+**Dentritic cells:**
+According to PanglaoDB, the markers indicate most probably to be Dentritic cells confidently.
+
+### Conclusion of this part (markers make sens eper cell type)
+My supervisor took a look at them and he told me that they do. Also that he wouldn't use PanglaoDB the way I used it, putting all the genes togetehr and looking at the conincidences, <span style="background-color: yellow">it is better to check gene by gene. Looking, if per cell type the genes we have are the same one sliterature found:
+- Chatgpt is great with this (give gene list and tell him to assigned one of the following cell types to each gene accoridng to literature)
+- PanglaoDB --> Datasets --> Cell type markers</span>
+
+```{r}
+# Execute this in the console !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# Saving the results in the Seurat object and then saving it locally
+pvp@misc$markers <- markers 
+# Saving pvp data
+saveRDS(pvp, file = paste0(path,"/RDS/",fl,".rds"))
+log_msg("RDS file saved.")
+```
+
+```{r}
+gene_sets <- top10_genesXcellType %>%
+  group_by(cluster) %>%
+  summarise(genes = list(unique(gene)), .groups = "drop")
+
+signatures <- setNames(gene_sets$genes, gene_sets$cluster)
+
+pvp <- AddModuleScore(pvp, features = signatures, ctrl = 10, name = "Top10Score_")
+
+score_cols <- grep("^Top10Score_", colnames(pvp@meta.data), value = TRUE)
+celltypes <- names(signatures)
+colnames(pvp@meta.data)[match(score_cols, colnames(pvp@meta.data))] <- paste0("Score_", celltypes)
+
+plot_df <- pvp@meta.data %>%
+  mutate(singler_label = singler_labels) %>%
+  dplyr::select(singler_label, starts_with("Score_")) %>%
+  pivot_longer(
+    cols = starts_with("Score_"),
+    names_to = "signature",
+    values_to = "score"
+  ) %>%
+  mutate(signature = sub("^Score_", "", signature)) %>%
+  group_by(signature, singler_label) %>%
+  summarise(sum_score = sum(score, na.rm = TRUE), .groups = "drop")
+
+# B-cells
+ggplot(plot_df %>% dplyr::filter(signature == "B-cells"),
+       aes(x = fct_reorder(singler_label, sum_score), y = sum_score)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    x = "SingleR label",
+    y = "Sum of AddModuleScore",
+    title = "B-cells signature score across SingleR labels"
+)
+```
+```{r}
+ggplot(plot_df %>% dplyr::filter(signature == "T-cells"),
+       aes(x = fct_reorder(singler_label, sum_score), y = sum_score)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    x = "SingleR label",
+    y = "Sum of AddModuleScore",
+    title = "T-cells signature score across SingleR labels"
+)
+```
+```{r}
+ggplot(plot_df %>% dplyr::filter(signature == "NK cells"),
+       aes(x = fct_reorder(singler_label, sum_score), y = sum_score)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    x = "SingleR label",
+    y = "Sum of AddModuleScore",
+    title = "NK cells signature score across SingleR labels"
+)
+```
+```{r}
+ggplot(plot_df %>% dplyr::filter(signature == "Granulocytes"),
+       aes(x = fct_reorder(singler_label, sum_score), y = sum_score)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    x = "SingleR label",
+    y = "Sum of AddModuleScore",
+    title = "Granulocytes signature score across SingleR labels"
+)
+```
+```{r}
+ggplot(plot_df %>% dplyr::filter(signature == "Monocytes"),
+       aes(x = fct_reorder(singler_label, sum_score), y = sum_score)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    x = "SingleR label",
+    y = "Sum of AddModuleScore",
+    title = "Monocytes signature score across SingleR labels"
+)
+```
+```{r}
+ggplot(plot_df %>% dplyr::filter(signature == "Plasma cells"),
+       aes(x = fct_reorder(singler_label, sum_score), y = sum_score)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    x = "SingleR label",
+    y = "Sum of AddModuleScore",
+    title = "Plasma cells signature score across SingleR labels"
+)
+```
+```{r}
+ggplot(plot_df %>% dplyr::filter(signature == "Macrophages"),
+       aes(x = fct_reorder(singler_label, sum_score), y = sum_score)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    x = "SingleR label",
+    y = "Sum of AddModuleScore",
+    title = "Macrophages signature score across SingleR labels"
+)
+```
+```{r}
+ggplot(plot_df %>% dplyr::filter(signature == "Epithelial cells"),
+       aes(x = fct_reorder(singler_label, sum_score), y = sum_score)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    x = "SingleR label",
+    y = "Sum of AddModuleScore",
+    title = "Epithelial cells signature score across SingleR labels"
+)
+```
+```{r}
+ggplot(plot_df %>% dplyr::filter(signature == "Endothelial cells"),
+       aes(x = fct_reorder(singler_label, sum_score), y = sum_score)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    x = "SingleR label",
+    y = "Sum of AddModuleScore",
+    title = "Endothelial cells signature score across SingleR labels"
+)
+```
+```{r}
+ggplot(plot_df %>% dplyr::filter(signature == "Fibroblasts"),
+       aes(x = fct_reorder(singler_label, sum_score), y = sum_score)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    x = "SingleR label",
+    y = "Sum of AddModuleScore",
+    title = "Fibroblasts signature score across SingleR labels"
+)
+```
+```{r}
+ggplot(plot_df %>% dplyr::filter(signature == "Smooth muscle"),
+       aes(x = fct_reorder(singler_label, sum_score), y = sum_score)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    x = "SingleR label",
+    y = "Sum of AddModuleScore",
+    title = "Smooth muscle signature score across SingleR labels"
+)
+```
+```{r}
+ggplot(plot_df %>% dplyr::filter(signature == "DC"),
+       aes(x = fct_reorder(singler_label, sum_score), y = sum_score)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    x = "SingleR label",
+    y = "Sum of AddModuleScore",
+    title = "DC signature score across SingleR labels"
+)
+```
+This code reshapes the Seurat metadata to keep only cells where the assigned label (`celltype`, from SingleR) matches the corresponding signature score (e.g., B-cell score in B-cells), then removes missing values. It then performs an ANOVA followed by a Tukey HSD post-hoc test to compare mean scores across cell types. Finally, it checks whether **all pairwise differences between cell types are statistically significant** (adjusted p-value < 0.05).
+
+```{r}
+score_df <- pvp@meta.data %>%
+  mutate(celltype = singler_labels) %>%
+  dplyr::select(celltype, starts_with("Score_")) %>%
+  pivot_longer(-celltype, names_to = "signature", values_to = "score") %>%
+  mutate(signature = sub("^Score_", "", signature)) %>%
+  dplyr::filter(celltype == signature, !is.na(score))
+
+tukey_df <- TukeyHSD(aov(score ~ celltype, data = score_df))$celltype %>%
+  as.data.frame()
+
+# This returns:
+# TRUE → all cell types are significantly different from each other
+# FALSE → at least one pair is not significantly different
+print(all(tukey_df$`p adj` < 0.05))
+```
+```{r}
+# To see which pairs are not different:
+tukey_df[tukey_df$`p adj` >= 0.05, ]
+```
+
+After comparing the average expression of the most expressed genes per cell type across all the labeled cell by SingleR we can see that the cells annotated as **NK cells, Granulocytes, Monocytes and DC cells** are not confident enough. The next step here is to do the whole process again but with only this subset.
+
+```{r}
+# Getting which cell types are unconcrete
+mismatched_cell_types <- names(signatures)[
+  sapply(names(signatures), function(ct) {
+    idx <- which(as.character(plot_df$signature) == ct)
+    if (length(idx) == 0) return(TRUE)
+    sub <- plot_df[idx, ]
+    best_label <- as.character(sub$singler_label)[which.max(sub$sum_score)]
+    best_label != ct
+  })
+]
+
+mismatched_cell_types
+```
+```{r}
+# Making subset of ONLY unconcrete cell types
+pvp_subset <- subset(
+  pvp,
+  subset = singler_labels %in% setdiff(mismatched_cell_types, "Unassigned")
+)
+```
+
+```{r}
+# 1. Use those labels as identities
+Idents(pvp_subset) <- "singler_labels" # So that the clusters in FindAllMarkers are the cell types
+
+# 2. Use RNA assay for marker finding
+DefaultAssay(pvp_subset) <- "SCT"
+
+markers_subset <- FindAllMarkers(
+  pvp_subset, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+# 3. Top 10 genes per cell type
+# Keep only statistically significant positive markers
+# - p_val_adj < 0.05: significant after multiple-testing correction
+# - abs(avg_log2FC) > 0: gene is more expressed in that cell type than in the others
+markers_sig <- markers_subset %>%
+  dplyr::filter(
+    p_val_adj < 0.05, # p_val corrected for multiple tetsing (e.g. Bonferroni)
+    abs(avg_log2FC) > 0
+)
+
+# For each cell type, keep the top 10 genes with the highest positive log fold-change
+SUBSET_top10_genesXcellType <- markers_sig %>%
+  group_by(cluster) %>%
+  slice_max(order_by = abs(avg_log2FC), n = 10, with_ties = FALSE) %>%
+  ungroup()
+
+# Inspect result
+SUBSET_top10_genesXcellType
+```
+
+
+```{r}
+gene_sets <- SUBSET_top10_genesXcellType %>%
+  group_by(cluster) %>%
+  summarise(genes = list(unique(gene)), .groups = "drop")
+
+signatures_subset <- setNames(gene_sets$genes, gene_sets$cluster)
+
+pvp <- AddModuleScore(pvp_subset, features = signatures_subset, ctrl = 10, name = "Top10Score_")
+
+score_cols <- grep("^Top10Score_", colnames(pvp_subset@meta.data), value = TRUE)
+celltypes <- names(signatures_subset)
+colnames(pvp_subset@meta.data)[match(score_cols, colnames(pvp_subset@meta.data))] <- paste0("Score_", celltypes)
+
+plot_df <- pvp_subset@meta.data %>%
+  mutate(singler_label = singler_labels) %>%
+  dplyr::select(singler_label, starts_with("Score_")) %>%
+  pivot_longer(
+    cols = starts_with("Score_"),
+    names_to = "signature",
+    values_to = "score",
+    names_prefix = "Score_"
+  ) %>%
+  dplyr::filter(signature %in% names(signatures_subset)) %>%
+  group_by(signature, singler_label) %>%
+  summarise(sum_score = sum(score, na.rm = TRUE), .groups = "drop")
+
+# NK cells
+ggplot(plot_df %>% dplyr::filter(signature == "NK cells"),
+       aes(x = fct_reorder(singler_label, sum_score), y = sum_score)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    x = "SingleR label",
+    y = "Sum of AddModuleScore",
+    title = "NK cells signature score across SingleR labels"
+)
+```
+
+```{r}
+# Monocytes
+ggplot(plot_df %>% dplyr::filter(signature == "Monocytes"),
+       aes(x = fct_reorder(singler_label, sum_score), y = sum_score)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    x = "SingleR label",
+    y = "Sum of AddModuleScore",
+    title = "Monocytes signature score across SingleR labels"
+)
+```
+```{r}
+# Granulocytes
+ggplot(plot_df %>% dplyr::filter(signature == "Granulocytes"),
+       aes(x = fct_reorder(singler_label, sum_score), y = sum_score)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    x = "SingleR label",
+    y = "Sum of AddModuleScore",
+    title = "Granulocytes signature score across SingleR labels"
+)
+```
+```{r}
+# DC
+ggplot(plot_df %>% dplyr::filter(signature == "DC"),
+       aes(x = fct_reorder(singler_label, sum_score), y = sum_score)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    x = "SingleR label",
+    y = "Sum of AddModuleScore",
+    title = "DC signature score across SingleR labels"
+)
+```
+We should check if the DC cells are different from the monocytes as their sum of AddModuleScore is pretty close. Also we should make it for the granulocytes and monocytes as the first ones seem to be cells with low expression. --> How can we know this automatically ? Q la label del titulo sea la maxima en el plot y que la segunda no esté muy cerca de la primera
+
+```{r}
+# Getting which cell types are not differentiable
+# - The best label in the plot coincides with the title
+# - The second best label is not really close to the first one.
+mismatched_cell_types <- lapply(names(signatures_subset), function(ct) {
+  sub <- plot_df %>%
+    dplyr::filter(signature == ct) %>%
+    dplyr::arrange(dplyr::desc(sum_score))
+  
+  best_lab <- as.character(sub$singler_label[1])
+  second_lab <- as.character(sub$singler_label[2])
+  best_score <- sub$sum_score[1]
+  second_score <- sub$sum_score[2]
+  
+  labs <- c(
+    # Condition 1: best label must match the signature/title
+    if (best_lab != ct) c(ct, best_lab),
+    # Condition 2: second best must not be too close to the first one
+    if ((best_score - second_score) / abs(best_score) <= 0.1) c(best_lab, second_lab)
+  )
+  
+  if (length(labs)) setNames(list(unique(labs)), ct) else NULL
+})
+
+mismatched_cell_types <- mismatched_cell_types[!sapply(mismatched_cell_types, is.null)]
+mismatched_cell_types
+```
+
+
+
+Here we shouldn't do our function compute_pairwise... we should do FindMarkers (*it already gives the log2fold, no need to compute it*) between each group we are unsure about !!!!
+```{r}
+# Function to print pretty the markers per cell type
+pretty_print_markers <- function(markers_list) {
+  for (name in names(markers_list)) {
+    cat("\n", paste0("=== ", name, " ==="), "\n")
+    cat(paste(markers_list[[name]], collapse = ", "), "\n")
+  }
+}
+# Code 
+Idents(pvp_subset) <- "singler_labels" 
+DefaultAssay(pvp_subset) <- "SCT"
+
+DC.vs.Monocytes <- FindMarkers(pvp_subset, ident.1 = "DC", ident.2="Monocytes", logfc.threshold = 0.25)
+head(DC.vs.Monocytes, n = 10)
+
+# take top positive genes for each side as signatures
+markers_DC <- DC.vs.Monocytes %>%
+  dplyr::filter(avg_log2FC > 0.5, p_val_adj < 0.05) %>%
+  dplyr::arrange(desc(avg_log2FC)) %>%
+  head(20) %>%
+  rownames()
+
+markers_mono <- DC.vs.Monocytes %>%
+  dplyr::filter(avg_log2FC < -0.5, p_val_adj < 0.05) %>%
+  dplyr::arrange(avg_log2FC) %>%
+  head(20) %>%
+  rownames()
+
+signatures <- list(
+  DC = markers_DC,
+  Monocytes = markers_mono
+)
+
+pvp_subset <- AddModuleScore_UCell(pvp_subset, features = signatures, name = NULL)
+
+pretty_print_markers(signatures)
+VlnPlot(pvp_subset, features = c("DC", "Monocytes"), group.by = "singler_labels", pt.size = 0)
+```
+To silence doubt, this plot with the markers exclusive to one cell type are more than enough.
+```{r}
+Granulocytes.vs.Monocytes <- FindMarkers(pvp_subset, ident.1 = "Granulocytes", ident.2="Monocytes", logfc.threshold = 0.25)
+head(Granulocytes.vs.Monocytes, n = 10)
+
+# take top positive genes for each side as signatures
+markers_Granulocytes <- Granulocytes.vs.Monocytes %>%
+  dplyr::filter(avg_log2FC > 0.5, p_val_adj < 0.05) %>%
+  dplyr::arrange(desc(avg_log2FC)) %>%
+  head(20) %>%
+  rownames()
+
+markers_mono <- Granulocytes.vs.Monocytes %>%
+  dplyr::filter(avg_log2FC < -0.5, p_val_adj < 0.05) %>%
+  dplyr::arrange(avg_log2FC) %>%
+  head(20) %>%
+  rownames()
+
+signatures <- list(
+  Granulocytes = markers_Granulocytes,
+  Monocytes = markers_mono
+)
+
+pvp_subset <- AddModuleScore_UCell(pvp_subset, features = signatures, name = NULL)
+
+pretty_print_markers(signatures)
+VlnPlot(pvp_subset, features = c("Granulocytes", "Monocytes"), group.by = "singler_labels", pt.size = 0)
+```
+With all the plots and markers seen we can now confidently say that the singleR clusters behave like their assigned cell type more than any 
+
+
+
+Cells significantly expressed in T-cells para distinguir cd4, cd8 y tregs --> Two ways:
+- o seurat clustering with different resolutions o k-mean clustering (aiming to 3 clusters) and then look to the markers ==> All bad
+- o using SingleR with these 3 labels from the beggining
+
+The second approach might change the classification results, as it would be interesting to know investigate the differences we will to the first aproach in this markdown here and then the second one on the *Final_Annotation_Xenium*.
+
+To the clustering we could use the `FindClusters`and `Clustree` functions to know at which resolution we can have 3 clusters, but as a very low resolution would be needed for sure and to investigate new things we will use k-means algorithm !
+
+`GetAssayData(pbmc_small)` returns a matrix of genes × cells:
+- rows = genes
+- columns = cells
+
+`Embeddings(tcells, "pca")` returns a matrix with:
+- rows = cells
+- columns = PCA dimensions
+
+Useful canonical markers:
+- CD4 T cells: IL7R, LTB, MALAT1, LTB, MHC class II low, often CCR7, LTB
+- CD8 T cells: CD8A, CD8B, NKG7, CCL5, GZMK, GZMB, PRF1
+- Tregs: FOXP3, IL2RA, TIGIT, CTLA4, IKZF2, LAYN
+
+```{r}
+# subset T cells
+tcells <- subset(pvp, subset = singler_labels == "T-cells")
+
+# reprocess within T cells so the structure reflects CD4/CD8/Treg differences
+# tcells <- FindVariableFeatures(tcells)
+# tcells <- ScaleData(tcells)
+# tcells <- RunPCA(tcells)
+# # UMAP for visualization
+# tcells <- RunUMAP(tcells, dims = 1:10)
+
+# k-means on CELLS using PCA coordinates
+set.seed(123)
+km <- kmeans(Embeddings(tcells, "pca")[, 1:10], centers = 3)
+
+# store cluster labels
+tcells$kmeans_cluster_cells <- factor(km$cluster)
+
+# plot k-means clusters
+DimPlot(tcells, reduction = "umap", group.by = "kmeans_cluster_cells", label = TRUE)
+```
+
+```{r}
+# Then get the genes that define each k-means cluster
+Idents(tcells) <- "kmeans_cluster_cells"
+
+markers_km <- FindAllMarkers(
+  tcells,
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+)
+
+top_markers_km <- markers_km %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 10)
+
+top_markers_km
+```
+According to the markers from cluster 2 that griup seem to be a CD4 cell, let's see where the canonical markers for that cell type reside in the umap. Clsuter 1 is epithelial cells ? And the third are smooth muscle fibroblasts ???
+```{r}
+# CD4 cells: 
+FeaturePlot(tcells, reduction = "umap", features = c("CD4", "IL7R", "LTB", "CCR7", "MALAT1", "LTB", "MHC"))
+```
+```{r}
+# CD8 cells: 
+FeaturePlot(tcells, reduction = "umap" , features = c("CD8A", "TRAC", "CD8B", "NKG7", "CCL5", "GZMK", "GZMB"))
+```
+
+```{r}
+# Treg cells: 
+FeaturePlot(tcells, reduction = "umap", features = c("FOXP3", "IL2RA", "CTLA4", "TIGIT", "IKZF2"))
+```
+
+```{r}
+VlnPlot(
+  tcells,
+  features = c("IL7R", "CD8A", "FOXP3", "IL2RA"),
+  group.by = "kmeans_cluster_cells" , pt.size = 0
+)
+```
+The clusters made by k-means do no differentiate the different cell types we are dealing with. My supervisor suggested my trying different algorithms and with doing the renormalization before to see if it actually affects something.
+```{r}
+# set identities to k-means clusters
+Idents(tcells) <- "kmeans_cluster"
+
+# find all positive markers for every k-means cluster
+markers_kmeans <- FindAllMarkers(
+  tcells,
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+)
+
+head(markers_kmeans, n = 10)
+
+signatures <- markers_kmeans %>%
+  dplyr::filter(avg_log2FC > 0.5, p_val_adj < 0.05) %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::slice_max(order_by = avg_log2FC, n = 20, with_ties = FALSE) %>%
+  dplyr::summarise(genes = list(gene), .groups = "drop") %>%
+  tibble::deframe()
+names(signatures) <- paste0("KM_", names(signatures))
+
+tcells <- AddModuleScore_UCell(tcells, features = signatures, name = NULL)
+
+pretty_print_markers(signatures)
+VlnPlot(tcells, features = names(signatures), group.by = "singler_labels", pt.size = 0)
+```
+Okay the results with k means were horrible, let's try with seurat's clustering method.
+
+```{r}
+# Clustree
+resolutions <- c(0.02,0.04,0.05,0.06,0.08,0.09,0.1,0.2)
+DefaultAssay(tcells) <- "SCT"
+for (res in resolutions){
+  tcells <- FindClusters(object = tcells,graph.name = "sketch_snn",cluster.name = paste0("ReducedRES.",res), resolution = res, algorithm = 4)
+}
+
+# To avoid NaNs problems
+# cells that are actually in the sketch graph
+sketch_cells <- rownames(tcells@graphs$sketch_snn)
+# subset object to those cells only
+tcells_sketch <- subset(tcells, cells = sketch_cells)
+
+# now metadata columns ReducedRES.* should have no NAs
+p <- clustree::clustree(tcells_sketch@meta.data, prefix = "ReducedRES.")
+p
+```
+
+```{r}
+# reprocess within T cells so the structure reflects CD4/CD8/Treg differences
+# tcells_sketch <- FindVariableFeatures(tcells_sketch)
+# tcells_sketch <- ScaleData(tcells_sketch)
+# tcells_sketch <- RunPCA(tcells_sketch)
+# # UMAP for visualization
+# tcells_sketch <- RunUMAP(tcells_sketch, dims = 1:10)
+
+# plot leiden clusters
+DimPlot(tcells_sketch , reduction = "umap.sketch" ,group.by = "ReducedRES.0.08", label = TRUE)
+```
+Quitar 2 y rehacer clustering con 1, 4, 3
+
+
+```{r}
+# Then get the genes that define each leiden cluster
+Idents(tcells_sketch) <- "ReducedRES.0.08"
+
+markers_km <- FindAllMarkers(
+  tcells_sketch,
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+)
+
+top_markers_km <- markers_km %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 10)
+
+top_markers_km
+```
+Chatgpt for cluster's 1 gene list:
+- CD4 is directly present
+- IL7R is a strong marker for conventional CD4 / memory-like CD4 T cells
+- CD28, LTB, and CXCR4 also fit a CD4-like T-cell program
+- You do not show classic T-reg markers like FOXP3, IL2RA (CD25), CTLA4, TIGIT, IKZF2
+- You also do not show a clear CD8 signature such as CD8A, CD8B, CCL5, NKG7, PRF1, GZMB
+
+Cluster 2, epithelial ???
+Cluster 3, mast cells ?? JAJAAJAJAJA
+
+WHEN I DID IT WITHOUT RENORMALIZING AND ONLY 3 CLUSTERS: --> It seems it was better separated when normalized again
+Cluster 1 is mostly CD4, T -cells general
+Cluster 2 is endothelial again
+Cluster 3 has only 2 cells XD
+
+REGULATORY CD4 (TREG) HAS FOXP3 BUT THE CD4 NON REGULATORY HASN'T
+```{r}
+# CD4 cells: 
+FeaturePlot(tcells_sketch, reduction = "umap.sketch", features = c("CD4", "IL7R", "LTB", "CCR7", "MALAT1", "LTB", "MHC"))
+```
+```{r}
+# CD8 cells: 
+FeaturePlot(tcells_sketch, reduction = "umap.sketch" , features = c("CD8A", "CD8B", "TRAC", "CD8B", "NKG7", "CCL5", "GZMK", "GZMB"))
+```
+
+```{r}
+# Treg cells: 
+FeaturePlot(tcells_sketch, reduction = "umap.sketch", features = c("FOXP3", "IL2RA", "CTLA4", "TIGIT", "IKZF2"))
+```
+
+
+```{r}
+# Looking at the amount of unassigns AFTER to compare the change
+table(pvp$singler_labels)[order(names(table(pvp$singler_labels)))]
+table(pvp$Final_Labels)[order(names(table(pvp$Final_Labels)))]
+```
+
+
+For more information about how to do supervised annotation workflow with Xenium look at [this link](https://www.10xgenomics.com/analysis-guides/xenium-cell-type-annotation)  ==> perfect to argument why we should do the unsupervised algorithm
+
+
+For more information about QC made with Seurat object look at [this link](https://satijalab.org/seurat/articles/pbmc3k_tutorial.html) it also has information about assigning cell type in an unsupervised way !
+
+For more information about X10 Genomics worflow made with SpatialExperiment object look at [this link](https://lmweber.org/OSTA/pages/img-workflow-xenium.html#unsupervised) it also has information about assigning cell type in both supervised and unsupervised ways !
+
+[1] Cheng J, Jin X, Smyth GK, Chen Y. Benchmarking cell type annotation methods for 10x Xenium spatial transcriptomics data. BMC Bioinformatics. 2025 Jan 20;26(1):22. doi: 10.1186/s12859-025-06044-0. PMID: 39833693; PMCID: PMC11744978. https://pmc.ncbi.nlm.nih.gov/articles/PMC11744978/ 
+
+[2] https://www.celltypist.org/encyclopedia/Immune/v2
